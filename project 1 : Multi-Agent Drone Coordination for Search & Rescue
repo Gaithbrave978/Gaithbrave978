@@ -1,0 +1,155 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <limits>
+
+using namespace std;
+
+// ===========================
+// Position structure
+// Represents a 2D point (x, y) in the search area.
+// Includes distance calculation for nearest drone assignment.
+// ===========================
+struct Position {
+    double x, y;
+    Position(double _x = 0, double _y = 0) : x(_x), y(_y) {}
+    
+    // Calculate Euclidean distance to another position
+    double distanceTo(const Position& other) const {
+        return sqrt((x - other.x)*(x - other.x) + (y - other.y)*(y - other.y));
+    }
+};
+
+// ===========================
+// Drone class
+// Represents an autonomous drone in the swarm.
+// Maintains position, unique ID, and busy state for task assignment.
+// ===========================
+class Drone {
+public:
+    int id;           // Unique drone identifier
+    Position pos;     // Current position
+    bool busy;        // True if drone is assigned to a target
+    
+    Drone(int _id, Position _pos) : id(_id), pos(_pos), busy(false) {}
+};
+
+// ===========================
+// Target structure
+// Represents a victim that needs rescue.
+// Stores position and rescue status.
+// ===========================
+struct Target {
+    Position pos;     // Position of the target
+    bool rescued;     // True if target has been rescued
+    Target(Position _pos) : pos(_pos), rescued(false) {}
+};
+
+// ===========================
+// assignDrone function
+// Assigns the nearest available drone to a target.
+// Greedy approach: minimal distance assignment ensures fast rescue.
+// Returns the index of the assigned drone in the drones vector.
+// ===========================
+int assignDrone(vector<Drone>& drones, const Target& target) {
+    double minDistance = numeric_limits<double>::max();
+    int assignedDrone = -1;
+    
+    for (int i = 0; i < drones.size(); i++) {
+        if (!drones[i].busy) { // Consider only free drones
+            double d = drones[i].pos.distanceTo(target.pos);
+            if (d < minDistance) {
+                minDistance = d;
+                assignedDrone = i;
+            }
+        }
+    }
+    
+    if (assignedDrone != -1) {
+        drones[assignedDrone].busy = true; // Mark drone as busy for this task
+    }
+    
+    return assignedDrone;
+}
+
+// ===========================
+// moveDrone function
+// Moves a drone towards a target position at a given speed.
+// Uses vector normalization for smooth movement.
+// ===========================
+void moveDrone(Drone& drone, const Position& targetPos, double speed) {
+    double dx = targetPos.x - drone.pos.x;
+    double dy = targetPos.y - drone.pos.y;
+    double dist = sqrt(dx*dx + dy*dy);
+    
+    if (dist <= speed) {
+        // Drone reaches the target in this step
+        drone.pos = targetPos;
+    } else {
+        // Move proportionally along the vector
+        drone.pos.x += speed * dx / dist;
+        drone.pos.y += speed * dy / dist;
+    }
+}
+
+// ===========================
+// Main Simulation Loop
+// Step-based discrete simulation of multi-agent search & rescue
+// ===========================
+int main() {
+    // Initialize drones at starting positions
+    vector<Drone> drones;
+    drones.push_back(Drone(1, Position(0,0)));
+    drones.push_back(Drone(2, Position(10,0)));
+    drones.push_back(Drone(3, Position(0,10)));
+
+    // Initialize targets (victims) at fixed positions
+    vector<Target> targets;
+    targets.push_back(Target(Position(5,5)));
+    targets.push_back(Target(Position(12,3)));
+    targets.push_back(Target(Position(7,14)));
+
+    double speed = 1.5; // Units per time step
+    int timeStep = 0;
+    
+    cout << "=== Multi-Drone Search & Rescue Simulation ===\n";
+    
+    // Simulation loop: continues until all targets are rescued
+    while (true) {
+        bool allRescued = true;
+        
+        for (auto& target : targets) {
+            if (!target.rescued) {
+                allRescued = false;
+                
+                // Assign the nearest free drone to this target
+                int droneIdx = assignDrone(drones, target);
+                
+                if (droneIdx != -1) {
+                    // Move the assigned drone towards the target
+                    moveDrone(drones[droneIdx], target.pos, speed);
+                    
+                    // Log movement for clarity and visualization
+                    cout << "Time " << timeStep << ": Drone " 
+                         << drones[droneIdx].id << " moving to target at (" 
+                         << target.pos.x << "," << target.pos.y << ")\n";
+                    
+                    // Check if drone reached the target
+                    if (drones[droneIdx].pos.distanceTo(target.pos) < 0.01) {
+                        target.rescued = true;         // Mark target as rescued
+                        drones[droneIdx].busy = false; // Drone becomes free
+                        cout << "Drone " << drones[droneIdx].id 
+                             << " rescued target at (" 
+                             << target.pos.x << "," << target.pos.y << ")\n";
+                    }
+                }
+            }
+        }
+        
+        if (allRescued) break; // Exit loop if all targets rescued
+        timeStep++;
+    }
+    
+    cout << "All targets rescued in " << timeStep << " time steps!\n";
+    return 0;
+}
