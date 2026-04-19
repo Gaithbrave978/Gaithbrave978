@@ -1,1604 +1,1602 @@
-     1 # =============================================================================
-     2 #   Gaith Krakdia Brain CT Scan model 1.0
-     3 #   High-Resolution Brain CT Cancer Detection System
-     4 #   Author  : Gaith Krakdia
-     5 #   Version : 1.0
-     6 # =============================================================================
-     7 #
-     8 #   Architecture overview
-     9 #   ─────────────────────
-    10 #   Stage 1 — Preprocessing
-    11 #     · Multi-channel HU windowing (5 clinical windows)
-    12 #     · Morphology-based skull stripping
-    13 #     · Isotropic resampling + Z-score normalisation
-    14 #     · 3-D sliding-window patch extraction
-    15 #     · On-the-fly augmentation (flip / rotate / noise / shift)
-    16 #
-    17 #   Stage 2 — 3D Attention U-Net  (voxel-wise segmentation)
-    18 #     · 4-level encoder with SE + residual blocks
-    19 #     · Transformer self-attention bottleneck
-    20 #     · Attention-gate decoder
-    21 #     · Output: background / oedema / enhancing-tumour mask
-    22 #
-    23 #   Stage 3 — 3D EfficientNet classifier  (cancer type)
-    24 #     · MBConv3D blocks with depthwise conv + SE
-    25 #     · Output: No Finding / Low-Grade Glioma / GBM /
-    26 #               Metastasis / Meningioma
-    27 #
-    28 #   Stage 4 — Ensemble fusion head
-    29 #     · Segmentation probability summary + classifier logits → MLP
-    30 #     · Final diagnosis probability vector
-    31 #
-    32 #   Stage 5 — Explainability & Uncertainty
-    33 #     · 3D Grad-CAM (classification + segmentation)
-    34 #     · Test-Time Augmentation (TTA × 8)
-    35 #     · Monte-Carlo Dropout uncertainty (MC × 20)
-    36 #
-    37 #   Requirements
-    38 #   ─────────────
-    39 #   pip install torch torchvision einops scipy scikit-image
-    40 #               SimpleITK nibabel matplotlib opencv-python
-    41 #               scikit-learn monai tqdm
-    42 #
-    43 #   Quick demo (no GPU / no data needed)
-    44 #   ──────────────────────────────────────
-    45 #   python "Gaith Krakdia Brain CT Scan model 1.0.py"
-    46 # =============================================================================
-    47
-    48 from __future__ import annotations
-    49
-    50 import ast
-    51 import copy
-    52 import json
-    53 import math
-    54 import os
-    55 import time
-    56 from typing import Dict, List, Optional, Tuple
-    57
-    58 import cv2
-    59 import matplotlib.pyplot as plt
-    60 import numpy as np
-    61 from scipy import ndimage
-    62 from skimage import measure, morphology
-    63 from tqdm import tqdm
-    64
-    65 import torch
-    66 import torch.nn as nn
-    67 import torch.nn.functional as F
-    68 from einops import rearrange
-    69 from torch.cuda.amp import GradScaler, autocast
-    70 from torch.optim import AdamW
-    71 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-    72 from torch.utils.data import DataLoader, Dataset
-    73
-    74
-    75 # ══════════════════════════════════════════════════════════════════════════════
-    76 #  SECTION 1 — PREPROCESSING
-    77 # ══════════════════════════════════════════════════════════════════════════════
-    78
-    79 HU_WINDOWS: Dict[str, Tuple[float, float]] = {
-    80     "brain":        (-20,   80),
-    81     "blood":        ( 50,  100),
-    82     "bone":         (400, 1000),
-    83     "tumor":        ( 20,   60),
-    84     "white_matter": ( 20,   45),
-    85 }
-    86
-    87 CLS_NAMES = [
-    88     "No Finding",
-    89     "Low-Grade Glioma",
-    90     "High-Grade Glioma / GBM",
-    91     "Metastasis",
-    92     "Meningioma",
-    93 ]
-    94
-    95 SEG_NAMES = ["background", "oedema", "enhancing_tumour"]
-    96
-    97
-    98 def apply_hu_window(volume: np.ndarray, wmin: float, wmax: float) -> np.ndarray:
-    99     """Clip HU values to [wmin, wmax] and scale linearly to [0, 1]."""
-   100     return (np.clip(volume, wmin, wmax) - wmin) / (wmax - wmin)
-   101
-   102
-   103 def multi_channel_window(volume: np.ndarray) -> np.ndarray:
-   104     """
-   105     Produce a 5-channel float32 representation of a single HU volume.
-   106     Each channel uses a clinically meaningful window — analogous to
-   107     different MRI sequences in terms of tissue contrast.
-   108     Output shape: (5, D, H, W)
-   109     """
-   110     channels = [
-   111         apply_hu_window(volume, lo, hi)
-   112         for lo, hi in HU_WINDOWS.values()
-   113     ]
-   114     return np.stack(channels, axis=0).astype(np.float32)
-   115
-   116
-   117 def strip_skull(
-   118     volume: np.ndarray,
-   119     hu_min: float = -20,
-   120     hu_max: float = 80,
-   121 ) -> Tuple[np.ndarray, np.ndarray]:
-   122     """
-   123     Morphology-based skull stripping.
-   124     Returns (stripped_volume, binary_brain_mask).
-   125     """
-   126     mask = np.logical_and(volume >= hu_min, volume <= hu_max)
-   127     mask = morphology.remove_small_objects(mask, min_size=5_000)
-   128
-   129     filled = np.zeros_like(mask)
-   130     for i in range(mask.shape[0]):
-   131         filled[i] = ndimage.binary_fill_holes(mask[i])
-   132
-   133     labeled = measure.label(filled)
-   134     props   = measure.regionprops(labeled)
-   135     if props:
-   136         largest = max(props, key=lambda p: p.area)
-   137         mask = (labeled == largest.label)
-   138     else:
-   139         mask = filled
-   140
-   141     stripped = volume.copy().astype(np.float32)
-   142     stripped[~mask] = -1000
-   143     return stripped, mask.astype(np.uint8)
-   144
-   145
-   146 def resample_isotropic(
-   147     volume: np.ndarray,
-   148     current_spacing: Tuple[float, ...],
-   149     target_spacing: float = 1.0,
-   150 ) -> np.ndarray:
-   151     """Resample a volume to isotropic voxel spacing via cubic zoom."""
-   152     zoom_factors = [s / target_spacing for s in current_spacing]
-   153     return ndimage.zoom(volume, zoom_factors, order=1)
-   154
-   155
-   156 def z_score_normalize(
-   157     volume: np.ndarray,
-   158     mask: Optional[np.ndarray] = None,
-   159 ) -> np.ndarray:
-   160     """Z-score normalisation, optionally restricted to brain-mask voxels."""
-   161     vals  = volume[mask > 0] if mask is not None else volume.flatten()
-   162     mu    = vals.mean()
-   163     sigma = vals.std() + 1e-8
-   164     return (volume - mu) / sigma
-   165
-   166
-   167 def extract_patches_3d(
-   168     volume: np.ndarray,
-   169     patch_size: int = 64,
-   170     stride: int = 32,
-   171 ) -> Tuple[np.ndarray, List[Tuple]]:
-   172     """
-   173     Sliding-window 3-D patch extraction.
-   174     Returns (patches array [N, C, D, H, W], list of (d1,h1,w1,d2,h2,w2)).
-   175     """
-   176     D, H, W = volume.shape[-3:]
-   177     patches, coords = [], []
-   178
-   179     for d in range(0, max(1, D - patch_size + 1), stride):
-   180         for h in range(0, max(1, H - patch_size + 1), stride):
-   181             for w in range(0, max(1, W - patch_size + 1), stride):
-   182                 d2 = min(d + patch_size, D)
-   183                 h2 = min(h + patch_size, H)
-   184                 w2 = min(w + patch_size, W)
-   185                 patch = volume[..., d:d2, h:h2, w:w2]
-   186                 pd = patch_size - patch.shape[-3]
-   187                 ph = patch_size - patch.shape[-2]
-   188                 pw = patch_size - patch.shape[-1]
-   189                 if pd > 0 or ph > 0 or pw > 0:
-   190                     patch = np.pad(
-   191                         patch,
-   192                         [(0, 0)] * (patch.ndim - 3) + [(0, pd), (0, ph), (0, pw)],
-   193                     )
-   194                 patches.append(patch)
-   195                 coords.append((d, h, w, d2, h2, w2))
-   196
-   197     return np.stack(patches), coords
-   198
-   199
-   200 class CTAugmentor:
-   201     """On-the-fly 3-D augmentation for training."""
-   202
-   203     def __init__(self, p: float = 0.5):
-   204         self.p = p
-   205
-   206     def random_flip(
-   207         self,
-   208         vol: torch.Tensor,
-   209         seg: torch.Tensor,
-   210     ) -> Tuple[torch.Tensor, torch.Tensor]:
-   211         for axis in [2, 3, 4]:
-   212             if torch.rand(1) < self.p:
-   213                 vol = torch.flip(vol, [axis])
-   214                 seg = torch.flip(seg, [axis])
-   215         return vol, seg
-   216
-   217     def random_rotate90(
-   218         self,
-   219         vol: torch.Tensor,
-   220         seg: torch.Tensor,
-   221     ) -> Tuple[torch.Tensor, torch.Tensor]:
-   222         k = int(torch.randint(0, 4, (1,)).item())
-   223         return torch.rot90(vol, k, [3, 4]), torch.rot90(seg, k, [3, 4])
-   224
-   225     def random_intensity_shift(self, vol: torch.Tensor) -> torch.Tensor:
-   226         if torch.rand(1) < self.p:
-   227             shift = (torch.rand(1) - 0.5) * 0.2
-   228             scale = 1.0 + (torch.rand(1) - 0.5) * 0.2
-   229             vol   = vol * scale + shift
-   230         return vol
-   231
-   232     def random_gaussian_noise(self, vol: torch.Tensor) -> torch.Tensor:
-   233         if torch.rand(1) < self.p:
-   234             vol = vol + torch.randn_like(vol) * 0.02
-   235         return vol
-   236
-   237     def __call__(
-   238         self,
-   239         vol: torch.Tensor,
-   240         seg: torch.Tensor,
-   241     ) -> Tuple[torch.Tensor, torch.Tensor]:
-   242         vol, seg = self.random_flip(vol, seg)
-   243         vol, seg = self.random_rotate90(vol, seg)
-   244         vol      = self.random_intensity_shift(vol)
-   245         vol      = self.random_gaussian_noise(vol)
-   246         return vol, seg
-   247
-   248
-   249 # ══════════════════════════════════════════════════════════════════════════════
-   250 #  SECTION 2 — MODEL BUILDING BLOCKS
-   251 # ══════════════════════════════════════════════════════════════════════════════
-   252
-   253 class ConvBnRelu(nn.Module):
-   254     """Conv3d → InstanceNorm → LeakyReLU."""
-   255
-   256     def __init__(
-   257         self,
-   258         in_ch: int,
-   259         out_ch: int,
-   260         kernel: int = 3,
-   261         stride: int = 1,
-   262         groups: int = 1,
-   263     ):
-   264         super().__init__()
-   265         self.block = nn.Sequential(
-   266             nn.Conv3d(
-   267                 in_ch, out_ch, kernel,
-   268                 stride=stride, padding=kernel // 2,
-   269                 groups=groups, bias=False,
-   270             ),
-   271             nn.InstanceNorm3d(out_ch, affine=True),
-   272             nn.LeakyReLU(0.1, inplace=True),
-   273         )
-   274
-   275     def forward(self, x: torch.Tensor) -> torch.Tensor:
-   276         return self.block(x)
-   277
-   278
-   279 class ResidualBlock(nn.Module):
-   280     """Pre-activation residual block with instance normalisation."""
-   281
-   282     def __init__(self, ch: int, dropout: float = 0.1):
-   283         super().__init__()
-   284         self.norm1  = nn.InstanceNorm3d(ch, affine=True)
-   285         self.conv1  = nn.Conv3d(ch, ch, 3, padding=1, bias=False)
-   286         self.norm2  = nn.InstanceNorm3d(ch, affine=True)
-   287         self.drop   = nn.Dropout3d(dropout)
-   288         self.conv2  = nn.Conv3d(ch, ch, 3, padding=1, bias=False)
-   289         self.act    = nn.LeakyReLU(0.1, inplace=True)
-   290
-   291     def forward(self, x: torch.Tensor) -> torch.Tensor:
-   292         h = self.conv1(self.act(self.norm1(x)))
-   293         h = self.conv2(self.drop(self.act(self.norm2(h))))
-   294         return x + h
-   295
-   296
-   297 class SEBlock3D(nn.Module):
-   298     """3-D Squeeze-and-Excitation channel attention."""
-   299
-   300     def __init__(self, ch: int, ratio: int = 4):
-   301         super().__init__()
-   302         self.se = nn.Sequential(
-   303             nn.AdaptiveAvgPool3d(1),
-   304             nn.Flatten(),
-   305             nn.Linear(ch, max(1, ch // ratio)),
-   306             nn.SiLU(),
-   307             nn.Linear(max(1, ch // ratio), ch),
-   308             nn.Sigmoid(),
-   309         )
-   310
-   311     def forward(self, x: torch.Tensor) -> torch.Tensor:
-   312         w = self.se(x).view(x.size(0), x.size(1), 1, 1, 1)
-   313         return x * w
-   314
-   315
-   316 class AttentionGate(nn.Module):
-   317     """
-   318     Spatial attention gate (Oktay et al., Attention U-Net, 2018).
-   319     Suppresses irrelevant skip-connection activations in the decoder.
-   320     """
-   321
-   322     def __init__(self, F_g: int, F_l: int, F_int: int):
-   323         super().__init__()
-   324         self.W_g = nn.Sequential(
-   325             nn.Conv3d(F_g, F_int, 1, bias=True),
-   326             nn.InstanceNorm3d(F_int, affine=True),
-   327         )
-   328         self.W_x = nn.Sequential(
-   329             nn.Conv3d(F_l, F_int, 1, bias=True),
-   330             nn.InstanceNorm3d(F_int, affine=True),
-   331         )
-   332         self.psi = nn.Sequential(
-   333             nn.Conv3d(F_int, 1, 1, bias=True),
-   334             nn.InstanceNorm3d(1, affine=True),
-   335             nn.Sigmoid(),
-   336         )
-   337         self.relu = nn.ReLU(inplace=True)
-   338
-   339     def forward(self, g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-   340         g1 = self.W_g(g)
-   341         x1 = self.W_x(x)
-   342         if g1.shape != x1.shape:
-   343             g1 = F.interpolate(g1, size=x1.shape[2:],
-   344                                mode="trilinear", align_corners=False)
-   345         return x * self.psi(self.relu(g1 + x1))
-   346
-   347
-   348 class TransformerBottleneck(nn.Module):
-   349     """
-   350     Lightweight ViT-style multi-head self-attention at the U-Net bottleneck.
-   351     Captures long-range spatial dependencies across the full volume.
-   352     """
-   353
-   354     def __init__(self, ch: int, heads: int = 8, dropout: float = 0.1):
-   355         super().__init__()
-   356         self.norm1 = nn.LayerNorm(ch)
-   357         self.attn  = nn.MultiheadAttention(ch, heads,
-   358                                             dropout=dropout, batch_first=True)
-   359         self.norm2 = nn.LayerNorm(ch)
-   360         self.ff = nn.Sequential(
-   361             nn.Linear(ch, ch * 4), nn.GELU(),
-   362             nn.Dropout(dropout),
-   363             nn.Linear(ch * 4, ch), nn.Dropout(dropout),
-   364         )
-   365
-   366     def forward(self, x: torch.Tensor) -> torch.Tensor:
-   367         B, C, D, H, W = x.shape
-   368         t = rearrange(x, "b c d h w -> b (d h w) c")
-   369         t = t + self.attn(*([self.norm1(t)] * 3))[0]
-   370         t = t + self.ff(self.norm2(t))
-   371         return rearrange(t, "b (d h w) c -> b c d h w", d=D, h=H, w=W)
-   372
-   373
-   374 # ══════════════════════════════════════════════════════════════════════════════
-   375 #  SECTION 3 — 3D ATTENTION U-NET  (Segmentation)
-   376 # ══════════════════════════════════════════════════════════════════════════════
-   377
-   378 class EncoderBlock(nn.Module):
-   379     def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.1):
-   380         super().__init__()
-   381         self.conv = nn.Sequential(
-   382             ConvBnRelu(in_ch, out_ch),
-   383             ResidualBlock(out_ch, dropout),
-   384             SEBlock3D(out_ch),
-   385         )
-   386         self.pool = nn.MaxPool3d(2)
-   387
-   388     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-   389         skip = self.conv(x)
-   390         return self.pool(skip), skip
-   391
-   392
-   393 class DecoderBlock(nn.Module):
-   394     def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
-   395         super().__init__()
-   396         self.up   = nn.ConvTranspose3d(in_ch, in_ch // 2, 2, stride=2)
-   397         self.ag   = AttentionGate(in_ch // 2, skip_ch, out_ch // 2)
-   398         self.conv = nn.Sequential(
-   399             ConvBnRelu(in_ch // 2 + skip_ch, out_ch),
-   400             ResidualBlock(out_ch),
-   401         )
-   402
-   403     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-   404         x    = self.up(x)
-   405         skip = self.ag(x, skip)
-   406         return self.conv(torch.cat([x, skip], dim=1))
-   407
-   408
-   409 class AttentionUNet3D(nn.Module):
-   410     """
-   411     3-D Attention U-Net with Transformer bottleneck.
-   412
-   413     Input  : (B, in_channels, D, H, W)
-   414     Output : (B, n_classes, D, H, W)  — voxel-wise logits
-   415
-   416     Classes
-   417     -------
-   418     0  background
-   419     1  oedema / infiltration zone
-   420     2  enhancing tumour core
-   421     """
-   422
-   423     def __init__(
-   424         self,
-   425         in_channels: int = 5,
-   426         n_classes: int = 3,
-   427         base_ch: int = 32,
-   428     ):
-   429         super().__init__()
-   430         c = base_ch
-   431         self.enc1 = EncoderBlock(in_channels, c)
-   432         self.enc2 = EncoderBlock(c,    c * 2)
-   433         self.enc3 = EncoderBlock(c * 2, c * 4)
-   434         self.enc4 = EncoderBlock(c * 4, c * 8)
-   435         self.bottleneck = nn.Sequential(
-   436             ConvBnRelu(c * 8, c * 16),
-   437             ResidualBlock(c * 16),
-   438             TransformerBottleneck(c * 16),
-   439         )
-   440         self.dec4 = DecoderBlock(c * 16, c * 8,  c * 8)
-   441         self.dec3 = DecoderBlock(c * 8,  c * 4,  c * 4)
-   442         self.dec2 = DecoderBlock(c * 4,  c * 2,  c * 2)
-   443         self.dec1 = DecoderBlock(c * 2,  c,      c)
-   444         self.head = nn.Conv3d(c, n_classes, 1)
-   445         self._init_weights()
-   446
-   447     def _init_weights(self):
-   448         for m in self.modules():
-   449             if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d)):
-   450                 nn.init.kaiming_normal_(m.weight, nonlinearity="leaky_relu")
-   451                 if m.bias is not None:
-   452                     nn.init.zeros_(m.bias)
-   453             elif isinstance(m, nn.Linear):
-   454                 nn.init.trunc_normal_(m.weight, std=0.02)
-   455                 if m.bias is not None:
-   456                     nn.init.zeros_(m.bias)
-   457
-   458     def forward(self, x: torch.Tensor) -> torch.Tensor:
-   459         x, s1 = self.enc1(x)
-   460         x, s2 = self.enc2(x)
-   461         x, s3 = self.enc3(x)
-   462         x, s4 = self.enc4(x)
-   463         x     = self.bottleneck(x)
-   464         x     = self.dec4(x, s4)
-   465         x     = self.dec3(x, s3)
-   466         x     = self.dec2(x, s2)
-   467         x     = self.dec1(x, s1)
-   468         return self.head(x)
-   469
-   470
-   471 # ══════════════════════════════════════════════════════════════════════════════
-   472 #  SECTION 4 — 3D EfficientNet-style CLASSIFIER
-   473 # ══════════════════════════════════════════════════════════════════════════════
-   474
-   475 class MBConv3D(nn.Module):
-   476     """Mobile inverted bottleneck with 3-D depthwise convolution + SE."""
-   477
-   478     def __init__(
-   479         self,
-   480         in_ch: int,
-   481         out_ch: int,
-   482         expand: int = 6,
-   483         kernel: int = 3,
-   484         stride: int = 1,
-   485         se_ratio: int = 4,
-   486     ):
-   487         super().__init__()
-   488         mid         = in_ch * expand
-   489         self.expand = ConvBnRelu(in_ch, mid, 1) if expand != 1 else nn.Identity()
-   490         self.dw     = ConvBnRelu(mid, mid, kernel, stride=stride, groups=mid)
-   491         self.se     = SEBlock3D(mid, se_ratio)
-   492         self.proj   = nn.Sequential(
-   493             nn.Conv3d(mid, out_ch, 1, bias=False),
-   494             nn.InstanceNorm3d(out_ch, affine=True),
-   495         )
-   496         self.skip = stride == 1 and in_ch == out_ch
-   497
-   498     def forward(self, x: torch.Tensor) -> torch.Tensor:
-   499         h = self.proj(self.se(self.dw(self.expand(x))))
-   500         return x + h if self.skip else h
-   501
-   502
-   503 class CancerClassifier3D(nn.Module):
-   504     """
-   505     3-D EfficientNet-style patch classifier.
-   506
-   507     Input  : (B, in_channels, D, H, W)
-   508     Output : (B, n_classes)
-   509
-   510     Classes
-   511     -------
-   512     0  No finding / benign
-   513     1  Low-grade glioma
-   514     2  High-grade glioma / GBM
-   515     3  Brain metastasis
-   516     4  Meningioma
-   517     """
-   518
-   519     def __init__(
-   520         self,
-   521         in_channels: int = 5,
-   522         n_classes: int = 5,
-   523         dropout: float = 0.3,
-   524     ):
-   525         super().__init__()
-   526         self.stem = ConvBnRelu(in_channels, 32, 3, stride=2)
-   527         self.stages = nn.Sequential(
-   528             MBConv3D(32,  16,  expand=1),
-   529             MBConv3D(16,  24,  stride=2),
-   530             MBConv3D(24,  24),
-   531             MBConv3D(24,  40,  stride=2, kernel=5),
-   532             MBConv3D(40,  40,  kernel=5),
-   533             MBConv3D(40,  80,  stride=2),
-   534             MBConv3D(80,  80),
-   535             MBConv3D(80,  80),
-   536             MBConv3D(80,  112, kernel=5),
-   537             MBConv3D(112, 112, kernel=5),
-   538             MBConv3D(112, 112, kernel=5),
-   539             MBConv3D(112, 192, stride=2, kernel=5),
-   540             MBConv3D(192, 192, kernel=5),
-   541             MBConv3D(192, 192, kernel=5),
-   542             MBConv3D(192, 192, kernel=5),
-   543             MBConv3D(192, 320),
-   544         )
-   545         self.head = nn.Sequential(
-   546             ConvBnRelu(320, 1280, 1),
-   547             nn.AdaptiveAvgPool3d(1),
-   548             nn.Flatten(),
-   549             nn.Dropout(dropout),
-   550             nn.Linear(1280, n_classes),
-   551         )
-   552         self._init_weights()
-   553
-   554     def _init_weights(self):
-   555         for m in self.modules():
-   556             if isinstance(m, nn.Conv3d):
-   557                 nn.init.kaiming_normal_(m.weight)
-   558             elif isinstance(m, nn.Linear):
-   559                 nn.init.trunc_normal_(m.weight, std=0.02)
-   560                 if m.bias is not None:
-   561                     nn.init.zeros_(m.bias)
-   562
-   563     def forward(self, x: torch.Tensor) -> torch.Tensor:
-   564         return self.head(self.stages(self.stem(x)))
-   565
-   566
-   567 # ══════════════════════════════════════════════════════════════════════════════
-   568 #  SECTION 5 — ENSEMBLE FUSION
-   569 # ══════════════════════════════════════════════════════════════════════════════
-   570
-   571 class BrainCTEnsemble(nn.Module):
-   572     """
-   573     Full diagnostic pipeline in a single nn.Module:
-   574
-   575       AttentionUNet3D  ──► seg logits (B, 3, D, H, W)
-   576                                 │
-   577       CancerClassifier3D ◄──────┤  (CT + seg probs concatenated)
-   578                                 │
-   579       MetaFusion MLP   ──► final diagnosis (B, 5)
-   580
-   581     Parameters
-   582     ----------
-   583     in_ch       : input CT channels (5 for multi-window)
-   584     seg_classes : segmentation classes (default 3)
-   585     cls_classes : diagnosis classes   (default 5)
-   586     base_ch     : U-Net base channels (32 for production, 8 for unit tests)
-   587     """
-   588
-   589     def __init__(
-   590         self,
-   591         in_ch: int = 5,
-   592         seg_classes: int = 3,
-   593         cls_classes: int = 5,
-   594         base_ch: int = 32,
-   595     ):
-   596         super().__init__()
-   597         self.segmentor  = AttentionUNet3D(in_ch, seg_classes, base_ch)
-   598         self.classifier = CancerClassifier3D(in_ch + seg_classes, cls_classes)
-   599         self.fusion     = nn.Sequential(
-   600             nn.Linear(cls_classes + seg_classes, 128),
-   601             nn.GELU(),
-   602             nn.Dropout(0.2),
-   603             nn.Linear(128, cls_classes),
-   604         )
-   605
-   606     def forward(
-   607         self,
-   608         x: torch.Tensor,
-   609     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-   610         """
-   611         Returns
-   612         -------
-   613         seg_logits : (B, seg_classes, D, H, W)
-   614         cls_logits : (B, cls_classes)
-   615         fused      : (B, cls_classes)  ← use this for final diagnosis
-   616         """
-   617         seg_logits  = self.segmentor(x)
-   618         seg_probs   = torch.softmax(seg_logits, dim=1)
-   619         cls_input   = torch.cat([x, seg_probs], dim=1)
-   620         cls_logits  = self.classifier(cls_input)
-   621         seg_summary = seg_probs.mean(dim=[2, 3, 4])
-   622         fused       = self.fusion(torch.cat([cls_logits, seg_summary], dim=1))
-   623         return seg_logits, cls_logits, fused
-   624
-   625
-   626 # ══════════════════════════════════════════════════════════════════════════════
-   627 #  SECTION 6 — LOSS FUNCTIONS
-   628 # ══════════════════════════════════════════════════════════════════════════════
-   629
-   630 class DiceLoss(nn.Module):
-   631     """Soft multi-class Dice loss."""
-   632
-   633     def __init__(self, smooth: float = 1e-5):
-   634         super().__init__()
-   635         self.smooth = smooth
-   636
-   637     def forward(
-   638         self,
-   639         logits: torch.Tensor,
-   640         targets: torch.Tensor,
-   641     ) -> torch.Tensor:
-   642         probs = torch.softmax(logits, dim=1)
-   643         oh    = F.one_hot(targets.long(), probs.size(1)).permute(0, 4, 1, 2, 3).float()
-   644         dims  = (0, 2, 3, 4)
-   645         inter = (probs * oh).sum(dims)
-   646         union = (probs + oh).sum(dims)
-   647         return 1.0 - ((2 * inter + self.smooth) / (union + self.smooth)).mean()
-   648
-   649
-   650 class FocalLoss(nn.Module):
-   651     """Focal loss — down-weights easy examples to focus on hard ones."""
-   652
-   653     def __init__(
-   654         self,
-   655         gamma: float = 2.0,
-   656         weight: Optional[torch.Tensor] = None,
-   657     ):
-   658         super().__init__()
-   659         self.gamma  = gamma
-   660         self.weight = weight
-   661
-   662     def forward(
-   663         self,
-   664         logits: torch.Tensor,
-   665         targets: torch.Tensor,
-   666     ) -> torch.Tensor:
-   667         ce  = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
-   668         p_t = torch.exp(-ce)
-   669         return ((1 - p_t) ** self.gamma * ce).mean()
-   670
-   671
-   672 class CombinedSegLoss(nn.Module):
-   673     """Dice (0.5) + Cross-Entropy (0.3) + Focal (0.2) combined loss."""
-   674
-   675     def __init__(
-   676         self,
-   677         dice_w: float = 0.5,
-   678         ce_w:   float = 0.3,
-   679         focal_w: float = 0.2,
-   680     ):
-   681         super().__init__()
-   682         self.dice  = DiceLoss()
-   683         self.focal = FocalLoss()
-   684         self.w     = (dice_w, ce_w, focal_w)
-   685
-   686     def forward(
-   687         self,
-   688         logits: torch.Tensor,
-   689         targets: torch.Tensor,
-   690     ) -> torch.Tensor:
-   691         return (
-   692             self.w[0] * self.dice(logits, targets)
-   693             + self.w[1] * F.cross_entropy(logits, targets.long())
-   694             + self.w[2] * self.focal(logits, targets.long())
-   695         )
-   696
-   697
-   698 # ══════════════════════════════════════════════════════════════════════════════
-   699 #  SECTION 7 — GRAD-CAM EXPLAINABILITY
-   700 # ══════════════════════════════════════════════════════════════════════════════
-   701
-   702 class GradCAM3D:
-   703     """
-   704     Gradient-weighted Class Activation Mapping for 3-D CNNs.
-   705
-   706     Usage
-   707     -----
-   708     gcam    = GradCAM3D(model, target_layer=model.classifier.stages[-1])
-   709     heatmap = gcam(input_tensor, class_idx=2)   # 2 = High-Grade GBM
-   710     heatmap shape: (D, H, W), values in [0, 1]
-   711     """
-   712
-   713     def __init__(self, model: nn.Module, target_layer: nn.Module):
-   714         self.model        = model
-   715         self.target_layer = target_layer
-   716         self._gradients: Optional[torch.Tensor] = None
-   717         self._activations: Optional[torch.Tensor] = None
-   718         target_layer.register_forward_hook(
-   719             lambda _, __, o: setattr(self, "_activations", o.detach()))
-   720         target_layer.register_full_backward_hook(
-   721             lambda _, __, g: setattr(self, "_gradients", g[0].detach()))
-   722
-   723     @torch.enable_grad()
-   724     def __call__(
-   725         self,
-   726         x: torch.Tensor,
-   727         class_idx: Optional[int] = None,
-   728     ) -> np.ndarray:
-   729         self.model.eval()
-   730         x = x.requires_grad_(True)
-   731         logits = self.model(x)
-   732         if isinstance(logits, tuple):
-   733             logits = logits[2]
-   734         if class_idx is None:
-   735             class_idx = int(logits.argmax(dim=1).item())
-   736         self.model.zero_grad()
-   737         logits[0, class_idx].backward()
-   738         weights = self._gradients.mean(dim=[2, 3, 4], keepdim=True)
-   739         cam     = F.relu((weights * self._activations).sum(1, keepdim=True))
-   740         cam     = F.interpolate(cam, size=x.shape[2:],
-   741                                 mode="trilinear", align_corners=False)
-   742         cam     = cam.squeeze().cpu().numpy()
-   743         cam_max = cam.max()
-   744         return cam / (cam_max + 1e-8)
-   745
-   746
-   747 class SegGradCAM3D:
-   748     """Grad-CAM adapted for the segmentation head."""
-   749
-   750     def __init__(self, model: nn.Module, target_layer: nn.Module):
-   751         self.model        = model
-   752         self.target_layer = target_layer
-   753         self._gradients: Optional[torch.Tensor] = None
-   754         self._activations: Optional[torch.Tensor] = None
-   755         target_layer.register_forward_hook(
-   756             lambda _, __, o: setattr(self, "_activations", o.detach()))
-   757         target_layer.register_full_backward_hook(
-   758             lambda _, __, g: setattr(self, "_gradients", g[0].detach()))
-   759
-   760     @torch.enable_grad()
-   761     def __call__(
-   762         self,
-   763         x: torch.Tensor,
-   764         seg_class: int = 2,
-   765     ) -> np.ndarray:
-   766         self.model.eval()
-   767         x          = x.requires_grad_(True)
-   768         seg_log, *_ = self.model(x)
-   769         self.model.zero_grad()
-   770         seg_log[:, seg_class].mean().backward()
-   771         weights = self._gradients.mean(dim=[2, 3, 4], keepdim=True)
-   772         cam     = F.relu((weights * self._activations).sum(1, keepdim=True))
-   773         cam     = F.interpolate(cam, size=x.shape[2:],
-   774                                 mode="trilinear", align_corners=False)
-   775         cam     = cam.squeeze().cpu().numpy()
-   776         return cam / (cam.max() + 1e-8)
-   777
-   778
-   779 # ══════════════════════════════════════════════════════════════════════════════
-   780 #  SECTION 8 — METRICS
-   781 # ══════════════════════════════════════════════════════════════════════════════
-   782
-   783 def dice_coefficient(
-   784     pred: np.ndarray,
-   785     target: np.ndarray,
-   786     smooth: float = 1e-6,
-   787 ) -> float:
-   788     p = pred.astype(bool).flatten()
-   789     t = target.astype(bool).flatten()
-   790     return float((2 * (p & t).sum() + smooth) / (p.sum() + t.sum() + smooth))
-   791
-   792
-   793 def hausdorff_distance_95(
-   794     pred: np.ndarray,
-   795     target: np.ndarray,
-   796     voxel_spacing: Tuple[float, ...] = (1.0, 1.0, 1.0),
-   797 ) -> float:
-   798     """95th-percentile Hausdorff distance in millimetres."""
-   799     from scipy.spatial import cKDTree
-   800     pred_pts   = np.argwhere(pred   > 0).astype(float) * np.array(voxel_spacing)
-   801     target_pts = np.argwhere(target > 0).astype(float) * np.array(voxel_spacing)
-   802     if pred_pts.size == 0 or target_pts.size == 0:
-   803         return float("nan")
-   804     d_pt = cKDTree(target_pts).query(pred_pts,   workers=-1)[0]
-   805     d_tp = cKDTree(pred_pts).query(target_pts,   workers=-1)[0]
-   806     return float(max(np.percentile(d_pt, 95), np.percentile(d_tp, 95)))
-   807
-   808
-   809 def sensitivity_specificity(
-   810     pred: np.ndarray,
-   811     target: np.ndarray,
-   812 ) -> Dict[str, float]:
-   813     p  = pred.astype(bool).flatten()
-   814     t  = target.astype(bool).flatten()
-   815     tp = (p & t).sum();  tn = (~p & ~t).sum()
-   816     fp = (p & ~t).sum(); fn = (~p &  t).sum()
-   817     return dict(
-   818         sensitivity = float(tp / (tp + fn + 1e-8)),
-   819         specificity = float(tn / (tn + fp + 1e-8)),
-   820         ppv         = float(tp / (tp + fp + 1e-8)),
-   821         npv         = float(tn / (tn + fn + 1e-8)),
-   822     )
-   823
-   824
-   825 def evaluate_segmentation(
-   826     pred_mask: np.ndarray,
-   827     true_mask: np.ndarray,
-   828     spacing: Tuple[float, ...] = (1., 1., 1.),
-   829 ) -> Dict:
-   830     results = {}
-   831     for c, name in enumerate(SEG_NAMES):
-   832         if c == 0:
-   833             continue
-   834         p = (pred_mask == c).astype(np.uint8)
-   835         t = (true_mask == c).astype(np.uint8)
-   836         results[name] = dict(
-   837             dice = dice_coefficient(p, t),
-   838             hd95 = hausdorff_distance_95(p, t, spacing),
-   839             **sensitivity_specificity(p, t),
-   840         )
-   841     return results
-   842
-   843
-   844 def evaluate_classification(
-   845     y_true: np.ndarray,
-   846     y_pred: np.ndarray,
-   847     y_prob: np.ndarray,
-   848 ) -> Dict:
-   849     from sklearn.metrics import (
-   850         cohen_kappa_score, confusion_matrix,
-   851         classification_report, roc_auc_score,
-   852     )
-   853     cm     = confusion_matrix(y_true, y_pred)
-   854     report = classification_report(y_true, y_pred,
-   855                                    target_names=CLS_NAMES, output_dict=True)
-   856     kappa  = cohen_kappa_score(y_true, y_pred, weights="quadratic")
-   857     try:
-   858         auc = (roc_auc_score(y_true, y_prob[:, 1])
-   859                if y_prob.shape[1] == 2
-   860                else roc_auc_score(y_true, y_prob,
-   861                                   multi_class="ovr", average="macro"))
-   862     except ValueError:
-   863         auc = float("nan")
-   864     return dict(confusion_matrix=cm, report=report,
-   865                 quadratic_kappa=kappa, roc_auc=auc,
-   866                 accuracy=report["accuracy"])
-   867
-   868
-   869 def expected_calibration_error(
-   870     y_true: np.ndarray,
-   871     y_prob: np.ndarray,
-   872     n_bins: int = 15,
-   873 ) -> float:
-   874     confidences = y_prob.max(axis=1)
-   875     predictions = y_prob.argmax(axis=1)
-   876     accuracies  = (predictions == y_true).astype(float)
-   877     ece = 0.0
-   878     for lo, hi in zip(
-   879         np.linspace(0, 1, n_bins + 1)[:-1],
-   880         np.linspace(0, 1, n_bins + 1)[1:],
-   881     ):
-   882         mask = (confidences >= lo) & (confidences < hi)
-   883         if mask.sum():
-   884             ece += mask.mean() * abs(accuracies[mask].mean()
-   885                                      - confidences[mask].mean())
-   886     return float(ece)
-   887
-   888
-   889 # ══════════════════════════════════════════════════════════════════════════════
-   890 #  SECTION 9 — DATASET
-   891 # ══════════════════════════════════════════════════════════════════════════════
-   892
-   893 class BrainCTDataset(Dataset):
-   894     """
-   895     Torch Dataset that reads from a JSON manifest:
-   896
-   897     [
-   898       {
-   899         "id":      "case_001",
-   900         "ct":      "path/to/volume.npy",   (D, H, W) float32 HU
-   901         "seg":     "path/to/mask.npy",     (D, H, W) uint8 {0,1,2}
-   902         "label":   2,                      class index
-   903         "spacing": [1.0, 1.0, 1.0]        voxel spacing in mm
-   904       }, ...
-   905     ]
-   906
-   907     Compatible with BraTS, TCGA-GBM, and LIDC-IDRI naming conventions.
-   908     Foreground-oversampled patch extraction ensures rare tumour voxels
-   909     are seen during training.
-   910     """
-   911
-   912     def __init__(
-   913         self,
-   914         manifest_path: str,
-   915         patch_size: int = 64,
-   916         patches_per_volume: int = 8,
-   917         augment: bool = True,
-   918         foreground_oversample: float = 0.67,
-   919     ):
-   920         with open(manifest_path, encoding="utf-8") as f:
-   921             self.records = json.load(f)
-   922         self.patch_size = patch_size
-   923         self.n_patches  = patches_per_volume
-   924         self.augment    = augment
-   925         self.fg_rate    = foreground_oversample
-   926         self.augmentor  = CTAugmentor(p=0.5)
-   927
-   928     def __len__(self) -> int:
-   929         return len(self.records) * self.n_patches
-   930
-   931     def _load(self, idx: int) -> Dict:
-   932         rec     = self.records[idx // self.n_patches]
-   933         hu      = np.load(rec["ct"]).astype(np.float32)
-   934         seg     = np.load(rec["seg"]).astype(np.uint8)
-   935         spacing = tuple(rec.get("spacing", [1.0, 1.0, 1.0]))
-   936         hu, mask = strip_skull(hu)
-   937         hu       = z_score_normalize(hu, mask)
-   938         return dict(vol5=multi_channel_window(hu), seg=seg,
-   939                     label=int(rec["label"]), spacing=spacing)
-   940
-   941     def _sample_patch(
-   942         self,
-   943         vol5: np.ndarray,
-   944         seg: np.ndarray,
-   945     ) -> Tuple[np.ndarray, np.ndarray]:
-   946         D, H, W = vol5.shape[1:]
-   947         ps      = self.patch_size
-   948         if np.random.rand() < self.fg_rate and (seg > 0).any():
-   949             fc = np.argwhere(seg > 0)
-   950             c  = fc[np.random.randint(len(fc))]
-   951         else:
-   952             c = [np.random.randint(D), np.random.randint(H), np.random.randint(W)]
-   953
-   954         d0 = int(np.clip(c[0] - ps // 2, 0, max(0, D - ps)))
-   955         h0 = int(np.clip(c[1] - ps // 2, 0, max(0, H - ps)))
-   956         w0 = int(np.clip(c[2] - ps // 2, 0, max(0, W - ps)))
-   957
-   958         vp = vol5[:, d0:d0+ps, h0:h0+ps, w0:w0+ps]
-   959         sp = seg[    d0:d0+ps, h0:h0+ps, w0:w0+ps]
-   960         pd, ph, pw = ps - vp.shape[1], ps - vp.shape[2], ps - vp.shape[3]
-   961         if pd or ph or pw:
-   962             vp = np.pad(vp, [(0,0),(0,pd),(0,ph),(0,pw)])
-   963             sp = np.pad(sp,         [(0,pd),(0,ph),(0,pw)])
-   964         return vp, sp
-   965
-   966     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-   967         data      = self._load(idx)
-   968         vp, sp    = self._sample_patch(data["vol5"], data["seg"])
-   969         vol_t     = torch.from_numpy(vp.copy()).float()
-   970         seg_t     = torch.from_numpy(sp.copy()).long()
-   971         if self.augment:
-   972             vol_t, seg_f = self.augmentor(vol_t.unsqueeze(0),
-   973                                           seg_t.unsqueeze(0).float())
-   974             vol_t = vol_t.squeeze(0)
-   975             seg_t = seg_f.squeeze(0).long()
-   976         return dict(image=vol_t, seg_mask=seg_t,
-   977                     label=torch.tensor(data["label"], dtype=torch.long))
-   978
-   979
-   980 # ══════════════════════════════════════════════════════════════════════════════
-   981 #  SECTION 10 — TRAINING ENGINE
-   982 # ══════════════════════════════════════════════════════════════════════════════
-   983
-   984 class EMA:
-   985     """Exponential Moving Average of model weights for lower-variance inference."""
-   986
-   987     def __init__(self, model: nn.Module, decay: float = 0.9999):
-   988         self.model = copy.deepcopy(model).eval()
-   989         self.decay = decay
-   990
-   991     @torch.no_grad()
-   992     def update(self, model: nn.Module):
-   993         for ep, mp in zip(self.model.parameters(), model.parameters()):
-   994             ep.data.mul_(self.decay).add_(mp.data, alpha=1 - self.decay)
-   995
-   996
-   997 class Trainer:
-   998     """
-   999     Full training loop with:
-  1000       · Mixed-precision (AMP)
-  1001       · Cosine annealing with warm restarts
-  1002       · EMA weight averaging
-  1003       · Early stopping
-  1004       · Best-checkpoint saving
-  1005
-  1006     Parameters
-  1007     ----------
-  1008     model           : BrainCTEnsemble instance
-  1009     train_loader    : DataLoader yielding {image, seg_mask, label}
-  1010     val_loader      : DataLoader
-  1011     device          : 'cuda' or 'cpu'
-  1012     lr              : peak learning rate
-  1013     weight_decay    : AdamW L2 regularisation
-  1014     max_epochs      : hard ceiling on training epochs
-  1015     patience        : early-stopping patience
-  1016     checkpoint_path : where to save the best checkpoint
-  1017     """
-  1018
-  1019     def __init__(
-  1020         self,
-  1021         model: BrainCTEnsemble,
-  1022         train_loader: DataLoader,
-  1023         val_loader: DataLoader,
-  1024         device: str = "cuda",
-  1025         lr: float = 3e-4,
-  1026         weight_decay: float = 1e-5,
-  1027         max_epochs: int = 200,
-  1028         patience: int = 25,
-  1029         checkpoint_path: str = "best_brain_ct_model.pth",
-  1030     ):
-  1031         self.model    = model.to(device)
-  1032         self.ema      = EMA(model)
-  1033         self.train_dl = train_loader
-  1034         self.val_dl   = val_loader
-  1035         self.device   = device
-  1036         self.epochs   = max_epochs
-  1037         self.patience = patience
-  1038         self.ckpt     = checkpoint_path
-  1039
-  1040         self.seg_loss  = CombinedSegLoss()
-  1041         self.cls_loss  = FocalLoss(gamma=2.0)
-  1042         self.fuse_loss = FocalLoss(gamma=2.0)
-  1043
-  1044         self.opt    = AdamW(model.parameters(), lr=lr,
-  1045                             weight_decay=weight_decay, betas=(0.9, 0.999))
-  1046         self.sched  = CosineAnnealingWarmRestarts(self.opt, T_0=50, T_mult=2,
-  1047                                                    eta_min=lr * 0.01)
-  1048         self.scaler = GradScaler()
-  1049
-  1050         self.best_val_loss     = float("inf")
-  1051         self.epochs_no_improve = 0
-  1052         self.history: Dict[str, list] = {
-  1053             "train_loss": [], "val_loss": [],
-  1054             "val_auc":    [], "val_kappa": [],
-  1055         }
-  1056
-  1057     def _run_epoch(self, loader: DataLoader, train: bool) -> Dict[str, float]:
-  1058         self.model.train(train)
-  1059         seg_tot = cls_tot = fused_tot = total = 0.0
-  1060         all_preds, all_labels, all_probs = [], [], []
-  1061
-  1062         ctx = torch.enable_grad if train else torch.no_grad
-  1063         with ctx():
-  1064             for batch in tqdm(loader, leave=False,
-  1065                                desc="train" if train else " val "):
-  1066                 imgs    = batch["image"].to(self.device)
-  1067                 seg_tgt = batch["seg_mask"].to(self.device)
-  1068                 cls_tgt = batch["label"].to(self.device)
-  1069
-  1070                 with autocast():
-  1071                     seg_log, cls_log, fused = self.model(imgs)
-  1072                     l_seg   = self.seg_loss(seg_log, seg_tgt)
-  1073                     l_cls   = self.cls_loss(cls_log, cls_tgt)
-  1074                     l_fused = self.fuse_loss(fused,  cls_tgt)
-  1075                     loss    = 0.4 * l_seg + 0.3 * l_cls + 0.3 * l_fused
-  1076
-  1077                 if train:
-  1078                     self.opt.zero_grad()
-  1079                     self.scaler.scale(loss).backward()
-  1080                     self.scaler.unscale_(self.opt)
-  1081                     nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-  1082                     self.scaler.step(self.opt)
-  1083                     self.scaler.update()
-  1084                     self.ema.update(self.model)
-  1085
-  1086                 B = imgs.size(0)
-  1087                 seg_tot   += l_seg.item()   * B
-  1088                 cls_tot   += l_cls.item()   * B
-  1089                 fused_tot += l_fused.item() * B
-  1090                 total     += loss.item()    * B
-  1091
-  1092                 probs = torch.softmax(fused, 1).detach().cpu().numpy()
-  1093                 all_probs.append(probs)
-  1094                 all_preds.append(probs.argmax(1))
-  1095                 all_labels.append(cls_tgt.cpu().numpy())
-  1096
-  1097         N   = len(loader.dataset)
-  1098         prb = np.concatenate(all_probs)
-  1099         prd = np.concatenate(all_preds)
-  1100         lbl = np.concatenate(all_labels)
-  1101         met = evaluate_classification(lbl, prd, prb)
-  1102         ece = expected_calibration_error(lbl, prb)
-  1103
-  1104         return dict(loss=total/N, loss_seg=seg_tot/N, loss_cls=cls_tot/N,
-  1105                     loss_fused=fused_tot/N, accuracy=met["accuracy"],
-  1106                     roc_auc=met["roc_auc"], kappa=met["quadratic_kappa"], ece=ece)
-  1107
-  1108     def fit(self) -> Dict[str, list]:
-  1109         for epoch in range(1, self.epochs + 1):
-  1110             t0 = time.time()
-  1111             tr = self._run_epoch(self.train_dl, train=True)
-  1112             va = self._run_epoch(self.val_dl,   train=False)
-  1113             self.sched.step()
-  1114
-  1115             self.history["train_loss"].append(tr["loss"])
-  1116             self.history["val_loss"].append(va["loss"])
-  1117             self.history["val_auc"].append(va["roc_auc"])
-  1118             self.history["val_kappa"].append(va["kappa"])
-  1119
-  1120             print(
-  1121                 f"Epoch {epoch:03d}/{self.epochs}  "
-  1122                 f"loss tr={tr['loss']:.4f} va={va['loss']:.4f}  "
-  1123                 f"acc={va['accuracy']:.4f}  AUC={va['roc_auc']:.4f}  "
-  1124                 f"κ={va['kappa']:.4f}  ECE={va['ece']:.4f}  "
-  1125                 f"[{time.time()-t0:.1f}s]"
-  1126             )
-  1127
-  1128             if va["loss"] < self.best_val_loss:
-  1129                 self.best_val_loss     = va["loss"]
-  1130                 self.epochs_no_improve = 0
-  1131                 torch.save(dict(epoch=epoch, model=self.model.state_dict(),
-  1132                                 ema=self.ema.model.state_dict(),
-  1133                                 optimizer=self.opt.state_dict(),
-  1134                                 metrics=va), self.ckpt)
-  1135                 print(f"  ✓ checkpoint saved  (val_loss={va['loss']:.4f})")
-  1136             else:
-  1137                 self.epochs_no_improve += 1
-  1138                 if self.epochs_no_improve >= self.patience:
-  1139                     print(f"  Early stopping at epoch {epoch}.")
-  1140                     break
-  1141
-  1142         ckpt = torch.load(self.ckpt, map_location=self.device)
-  1143         self.model.load_state_dict(ckpt["model"])
-  1144         print(f"\nTraining complete.  Best val loss: {self.best_val_loss:.4f}")
-  1145         return self.history
-  1146
-  1147
-  1148 # ══════════════════════════════════════════════════════════════════════════════
-  1149 #  SECTION 11 — INFERENCE ENGINE
-  1150 # ══════════════════════════════════════════════════════════════════════════════
-  1151
-  1152 class BrainCTScanner:
-  1153     """
-  1154     End-to-end inference for a single brain CT volume.
-  1155
-  1156     Steps
-  1157     -----
-  1158     1. Multi-channel HU windowing
-  1159     2. Sliding-window 3-D segmentation (overlap-tile)
-  1160     3. TTA × tta_n classification
-  1161     4. MC-Dropout × mc_dropout_n uncertainty estimation
-  1162     5. 3-D Grad-CAM heatmaps
-  1163     6. Structured clinical report
-  1164
-  1165     Parameters
-  1166     ----------
-  1167     model_path   : path to a saved BrainCTEnsemble checkpoint
-  1168     device       : 'cuda' or 'cpu'
-  1169     patch_size   : cubic patch size for sliding window
-  1170     stride       : window stride (use stride < patch_size for overlap)
-  1171     tta_n        : test-time augmentation passes
-  1172     mc_dropout_n : MC-Dropout samples (0 = disabled)
-  1173     """
-  1174
-  1175     def __init__(
-  1176         self,
-  1177         model_path: str,
-  1178         device: str = "cuda",
-  1179         patch_size: int = 64,
-  1180         stride: int = 32,
-  1181         tta_n: int = 8,
-  1182         mc_dropout_n: int = 20,
-  1183     ):
-  1184         self.device     = torch.device(
-  1185             device if torch.cuda.is_available() else "cpu")
-  1186         self.patch_size = patch_size
-  1187         self.stride     = stride
-  1188         self.tta_n      = tta_n
-  1189         self.mc_n       = mc_dropout_n
-  1190         self.augmentor  = CTAugmentor(p=1.0)
-  1191
-  1192         self.model = BrainCTEnsemble(in_ch=5, seg_classes=3, cls_classes=5)
-  1193         ckpt  = torch.load(model_path, map_location=self.device)
-  1194         state = ckpt.get("ema", ckpt.get("model", ckpt))
-  1195         self.model.load_state_dict(state)
-  1196         self.model.to(self.device).eval()
-  1197
-  1198         self.gcam     = GradCAM3D(self.model,
-  1199                                    self.model.classifier.stages[-1])
-  1200         self.seg_gcam = SegGradCAM3D(self.model,
-  1201                                       self.model.segmentor.dec1)
-  1202
-  1203     @torch.no_grad()
-  1204     def _segment_volume(self, vol5: np.ndarray) -> np.ndarray:
-  1205         D, H, W   = vol5.shape[1:]
-  1206         seg_sum   = np.zeros((3, D, H, W), dtype=np.float32)
-  1207         count_map = np.zeros((D, H, W),    dtype=np.float32)
-  1208
-  1209         patches, coords = extract_patches_3d(vol5, self.patch_size, self.stride)
-  1210         for patch, (d1, h1, w1, d2, h2, w2) in zip(patches, coords):
-  1211             t = torch.from_numpy(patch).unsqueeze(0).to(self.device)
-  1212             prob = torch.softmax(self.model(t)[0], 1).squeeze(0).cpu().numpy()
-  1213             pd, ph, pw = d2 - d1, h2 - h1, w2 - w1
-  1214             seg_sum[:, d1:d2, h1:h2, w1:w2] += prob[:, :pd, :ph, :pw]
-  1215             count_map[   d1:d2, h1:h2, w1:w2] += 1.0
-  1216
-  1217         return seg_sum / np.maximum(count_map[None], 1)
-  1218
-  1219     def _classify_tta(self, x: torch.Tensor) -> np.ndarray:
-  1220         dummy = torch.zeros(x.size(0), 3, *x.shape[2:], device=self.device)
-  1221         probs = []
-  1222         for _ in range(self.tta_n):
-  1223             aug, _ = self.augmentor(x.clone(), torch.zeros_like(x[:, :1]))
-  1224             inp    = torch.cat([aug, dummy], dim=1)
-  1225             with torch.no_grad():
-  1226                 probs.append(
-  1227                     torch.softmax(self.model.classifier(inp), 1).cpu().numpy())
-  1228         return np.stack(probs).mean(0)
-  1229
-  1230     def _mc_uncertainty(
-  1231         self,
-  1232         x: torch.Tensor,
-  1233     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-  1234         if self.mc_n == 0:
-  1235             return None, None
-  1236
-  1237         dummy = torch.zeros(x.size(0), 3, *x.shape[2:], device=self.device)
-  1238         inp   = torch.cat([x, dummy], dim=1)
-  1239
-  1240         def _enable_dropout(m):
-  1241             if isinstance(m, (nn.Dropout, nn.Dropout3d)):
-  1242                 m.train()
-  1243
-  1244         self.model.apply(_enable_dropout)
-  1245         samples = []
-  1246         with torch.no_grad():
-  1247             for _ in range(self.mc_n):
-  1248                 samples.append(
-  1249                     torch.softmax(self.model.classifier(inp), 1).cpu().numpy())
-  1250         self.model.eval()
-  1251         samples = np.stack(samples)
-  1252         return samples.mean(0), samples.var(0).sum(-1)
-  1253
-  1254     def scan(
-  1255         self,
-  1256         hu_volume: np.ndarray,
-  1257         voxel_spacing: Tuple[float, ...] = (1., 1., 1.),
-  1258     ) -> Dict:
-  1259         """
-  1260         Run the full diagnostic pipeline on one CT volume.
-  1261
-  1262         Parameters
-  1263         ----------
-  1264         hu_volume     : (D, H, W) Hounsfield Unit array
-  1265         voxel_spacing : (dx, dy, dz) in millimetres
-  1266
-  1267         Returns
-  1268         -------
-  1269         {
-  1270           seg_mask    : (D, H, W) uint8  — 0/1/2 class labels
-  1271           seg_probs   : (3, D, H, W)     — soft probabilities
-  1272           cls_probs   : (5,)             — diagnosis probabilities
-  1273           cls_label   : str              — top diagnosis
-  1274           confidence  : float            — top-class probability
-  1275           uncertainty : float            — MC-Dropout variance
-  1276           gradcam_cls : (D, H, W)        — classification saliency map
-  1277           gradcam_seg : (D, H, W)        — segmentation saliency map
-  1278           report      : str              — formatted clinical report
-  1279         }
-  1280         """
-  1281         print("[1/5] Multi-channel HU windowing …")
-  1282         vol5 = multi_channel_window(hu_volume)
-  1283
-  1284         print("[2/5] Sliding-window segmentation …")
-  1285         seg_probs = self._segment_volume(vol5)
-  1286         seg_mask  = seg_probs.argmax(0).astype(np.uint8)
-  1287
-  1288         print("[3/5] TTA classification …")
-  1289         x    = torch.from_numpy(vol5).unsqueeze(0).to(self.device)
-  1290         tta  = self._classify_tta(x)
-  1291         mc_p, unc = self._mc_uncertainty(x)
-  1292         cls_probs  = (0.6 * tta + 0.4 * mc_p) if mc_p is not None else tta
-  1293         uncertainty = float(unc[0]) if unc is not None else 0.0
-  1294
-  1295         cls_idx    = int(cls_probs.argmax(1)[0])
-  1296         confidence = float(cls_probs[0, cls_idx])
-  1297
-  1298         print("[4/5] Generating Grad-CAM heatmaps …")
-  1299         gradcam_cls = self.gcam(x, class_idx=cls_idx)
-  1300         gradcam_seg = self.seg_gcam(x, seg_class=2)
-  1301
-  1302         print("[5/5] Generating report …")
-  1303         vv             = float(np.prod(voxel_spacing)) / 1000.0
-  1304         tumour_vol_cm3 = float((seg_mask == 2).sum()) * vv
-  1305         report         = _format_report(cls_idx, confidence, uncertainty,
-  1306                                         cls_probs[0], tumour_vol_cm3, seg_probs)
-  1307
-  1308         return dict(seg_mask=seg_mask, seg_probs=seg_probs,
-  1309                     cls_probs=cls_probs[0], cls_label=CLS_NAMES[cls_idx],
-  1310                     confidence=confidence, uncertainty=uncertainty,
-  1311                     gradcam_cls=gradcam_cls, gradcam_seg=gradcam_seg,
-  1312                     report=report)
-  1313
-  1314
-  1315 def _format_report(
-  1316     cls_idx: int,
-  1317     confidence: float,
-  1318     uncertainty: float,
-  1319     probs: np.ndarray,
-  1320     tumour_vol: float,
-  1321     seg_probs: np.ndarray,
-  1322 ) -> str:
-  1323     risk = ("CRITICAL" if cls_idx in (2, 3) and confidence > 0.70 else
-  1324             "HIGH"     if cls_idx in (1, 2, 3)                     else
-  1325             "LOW")
-  1326     oedema_vol = float((seg_probs.argmax(0) == 1).sum()) * 0.001
-  1327     lines = [
-  1328         "=" * 65,
-  1329         "  Gaith Krakdia Brain CT Scan model 1.0",
-  1330         "  CANCER DETECTION REPORT",
-  1331         "=" * 65,
-  1332         f"  Diagnosis     : {CLS_NAMES[cls_idx]}",
-  1333         f"  Risk Level    : {risk}",
-  1334         f"  Confidence    : {confidence * 100:.1f}%",
-  1335         f"  Uncertainty   : {uncertainty:.4f}  (MC-Dropout epistemic)",
-  1336         "",
-  1337         "  Class Probabilities:",
-  1338     ]
-  1339     for name, p in zip(CLS_NAMES, probs):
-  1340         bar = chr(9608) * int(p * 30)
-  1341         lines.append(f"    {name:<34s}  {p * 100:5.1f}%  {bar}")
-  1342     lines += [
-  1343         "",
-  1344         "  Segmentation Volumes:",
-  1345         f"    Oedema zone          : {oedema_vol:.2f} cm3",
-  1346         f"    Enhancing tumour     : {tumour_vol:.2f} cm3",
-  1347         "",
-  1348         "  WARNING: AI output is for research / decision-support only.",
-  1349         "           All findings MUST be reviewed by a qualified radiologist.",
-  1350         "=" * 65,
-  1351     ]
-  1352     return "\n".join(lines)
-  1353
-  1354
-  1355 # ══════════════════════════════════════════════════════════════════════════════
-  1356 #  SECTION 12 — VISUALISATION
-  1357 # ══════════════════════════════════════════════════════════════════════════════
-  1358
-  1359 _SEG_COLORS = np.array([
-  1360     [0,   0,   0  ],
-  1361     [0,   255, 255],
-  1362     [255, 50,  50 ],
-  1363 ], dtype=np.float32) / 255.0
-  1364
-  1365
-  1366 def _hu_to_uint8(vol: np.ndarray, wmin=-20, wmax=80) -> np.ndarray:
-  1367     return ((np.clip(vol, wmin, wmax) - wmin) / (wmax - wmin) * 255).astype(np.uint8)
-  1368
-  1369
-  1370 def _overlay_seg(ct: np.ndarray, seg: np.ndarray, alpha=0.4) -> np.ndarray:
-  1371     rgb = cv2.cvtColor(ct, cv2.COLOR_GRAY2RGB).astype(float)
-  1372     for c in range(1, 3):
-  1373         mask  = (seg == c)
-  1374         color = _SEG_COLORS[c] * 255
-  1375         for ch in range(3):
-  1376             rgb[..., ch] = np.where(mask,
-  1377                                      rgb[..., ch] * (1 - alpha) + color[ch] * alpha,
-  1378                                      rgb[..., ch])
-  1379     return np.clip(rgb, 0, 255).astype(np.uint8)
-  1380
-  1381
-  1382 def _overlay_cam(ct: np.ndarray, cam: np.ndarray, alpha=0.5) -> np.ndarray:
-  1383     jet = cv2.applyColorMap((cam * 255).astype(np.uint8), cv2.COLORMAP_JET)
-  1384     rgb = cv2.cvtColor(ct, cv2.COLOR_GRAY2RGB)
-  1385     return cv2.addWeighted(rgb, 1 - alpha, jet, alpha, 0)
-  1386
-  1387
-  1388 def plot_scan(
-  1389     hu_volume: np.ndarray,
-  1390     seg_mask: Optional[np.ndarray] = None,
-  1391     gradcam: Optional[np.ndarray] = None,
-  1392     n_slices: int = 6,
-  1393     title: str = "Gaith Krakdia Brain CT Scan model 1.0",
-  1394     save_path: Optional[str] = None,
-  1395 ):
-  1396     """
-  1397     Multi-slice visualisation:
-  1398       Row 1 — raw CT (brain window)
-  1399       Row 2 — segmentation overlay    (if seg_mask provided)
-  1400       Row 3 — Grad-CAM overlay        (if gradcam provided)
-  1401     """
-  1402     idxs   = np.linspace(0, hu_volume.shape[0] - 1, n_slices, dtype=int)
-  1403     n_rows = 1 + (seg_mask is not None) + (gradcam is not None)
-  1404     fig, axes = plt.subplots(n_rows, n_slices,
-  1405                               figsize=(n_slices * 3, n_rows * 3))
-  1406     if n_rows == 1:
-  1407         axes = axes[np.newaxis, :]
-  1408
-  1409     fig.suptitle(title, fontsize=14, fontweight="bold")
-  1410     for col, idx in enumerate(idxs):
-  1411         ct = _hu_to_uint8(hu_volume[idx])
-  1412         axes[0, col].imshow(ct, cmap="gray", vmin=0, vmax=255)
-  1413         axes[0, col].set_title(f"z={idx}", fontsize=9)
-  1414         axes[0, col].axis("off")
-  1415         r = 1
-  1416         if seg_mask is not None:
-  1417             axes[r, col].imshow(_overlay_seg(ct, seg_mask[idx]))
-  1418             axes[r, col].axis("off")
-  1419             r += 1
-  1420         if gradcam is not None:
-  1421             axes[r, col].imshow(_overlay_cam(ct, gradcam[idx]))
-  1422             axes[r, col].axis("off")
-  1423
-  1424     row_labels = ["CT (brain window)"]
-  1425     if seg_mask is not None: row_labels.append("Segmentation")
-  1426     if gradcam  is not None: row_labels.append("Grad-CAM")
-  1427     for row, label in enumerate(row_labels):
-  1428         axes[row, 0].set_ylabel(label, fontsize=10)
-  1429
-  1430     plt.tight_layout()
-  1431     if save_path:
-  1432         plt.savefig(save_path, dpi=150, bbox_inches="tight")
-  1433         print(f"Saved: {save_path}")
-  1434     else:
-  1435         plt.show()
-  1436
-  1437
-  1438 def plot_probabilities(
-  1439     cls_probs: np.ndarray,
-  1440     save_path: Optional[str] = None,
-  1441 ):
-  1442     """Horizontal probability bar chart with colour-coded risk."""
-  1443     colors = ["#4CAF50", "#8BC34A", "#FF9800", "#F44336", "#9C27B0"]
-  1444     fig, ax = plt.subplots(figsize=(9, 4))
-  1445     y = range(len(CLS_NAMES))
-  1446     bars = ax.barh(y, cls_probs * 100, color=colors, edgecolor="white", height=0.6)
-  1447     ax.set_yticks(y)
-  1448     ax.set_yticklabels(CLS_NAMES, fontsize=11)
-  1449     ax.set_xlabel("Probability (%)", fontsize=11)
-  1450     ax.set_title("Gaith Krakdia Brain CT Scan — Cancer Classification",
-  1451                   fontsize=12, fontweight="bold")
-  1452     ax.set_xlim(0, 108)
-  1453     ax.axvline(50, color="gray", linestyle="--", lw=0.8, alpha=0.5)
-  1454     for bar, p in zip(bars, cls_probs):
-  1455         ax.text(bar.get_width() + 1.5, bar.get_y() + bar.get_height() / 2,
-  1456                 f"{p*100:.1f}%", va="center", fontsize=10, fontweight="bold")
-  1457     plt.tight_layout()
-  1458     if save_path:
-  1459         plt.savefig(save_path, dpi=150, bbox_inches="tight")
-  1460     else:
-  1461         plt.show()
-  1462
-  1463
-  1464 def plot_training_curves(
-  1465     history: Dict[str, list],
-  1466     save_path: Optional[str] = None,
-  1467 ):
-  1468     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
-  1469     ax1.plot(history["train_loss"], label="Train", color="#2196F3")
-  1470     ax1.plot(history["val_loss"],   label="Val",   color="#F44336")
-  1471     ax1.set_xlabel("Epoch"); ax1.set_ylabel("Loss")
-  1472     ax1.set_title("Loss Curves"); ax1.legend(); ax1.grid(alpha=0.3)
-  1473
-  1474     ax2.plot(history["val_auc"],   label="Val AUC",   color="#4CAF50")
-  1475     ax2.plot(history["val_kappa"], label="Val Kappa",  color="#FF9800")
-  1476     ax2.set_xlabel("Epoch"); ax2.set_ylabel("Score")
-  1477     ax2.set_title("Validation Metrics"); ax2.legend()
-  1478     ax2.set_ylim(0, 1); ax2.grid(alpha=0.3)
-  1479     plt.tight_layout()
-  1480     if save_path:
-  1481         plt.savefig(save_path, dpi=150, bbox_inches="tight")
-  1482     else:
-  1483         plt.show()
-  1484
-  1485
-  1486 # ══════════════════════════════════════════════════════════════════════════════
-  1487 #  SECTION 13 — DEMO  (run with:  python "Gaith Krakdia Brain CT Scan model 1.0.py")
-  1488 # ══════════════════════════════════════════════════════════════════════════════
-  1489
-  1490 def _make_synthetic_ct(shape=(64, 128, 128), seed=42) -> np.ndarray:
-  1491     """Generate a synthetic HU volume with an embedded GBM-like lesion."""
-  1492     rng = np.random.default_rng(seed)
-  1493     vol = rng.normal(-10, 15, shape).astype(np.float32)
-  1494     D, H, W = shape
-  1495     z, y, x = np.ogrid[:D, :H, :W]
-  1496
-  1497     brain = ((z-D//2)**2/(D//3)**2 + (y-H//2)**2/(H//2.5)**2 +
-  1498              (x-W//2)**2/(W//2.5)**2) < 1
-  1499     vol[brain] = rng.normal(35, 8, int(brain.sum()))
-  1500
-  1501     lesion = ((z-D//2-4)**2/8**2 + (y-H//2-6)**2/12**2 +
-  1502               (x-W//2+8)**2/12**2) < 1
-  1503     vol[lesion] = rng.normal(55, 12, int(lesion.sum()))
-  1504
-  1505     necrosis = ((z-D//2-5)**2/4**2 + (y-H//2-5)**2/5**2 +
-  1506                 (x-W//2+9)**2/5**2) < 1
-  1507     vol[necrosis] = rng.normal(-20, 5, int(necrosis.sum()))
-  1508
-  1509     return vol
-  1510
-  1511
-  1512 def run_demo():
-  1513     print("=" * 65)
-  1514     print("  Gaith Krakdia Brain CT Scan model 1.0  —  Demo")
-  1515     print("=" * 65)
-  1516
-  1517     # ── Build model ───────────────────────────────────────────────────────────
-  1518     print("\n[1/6] Initialising BrainCTEnsemble …")
-  1519     model  = BrainCTEnsemble(in_ch=5, seg_classes=3, cls_classes=5, base_ch=16)
-  1520     n_all  = sum(p.numel() for p in model.parameters())
-  1521     n_seg  = sum(p.numel() for p in model.segmentor.parameters())
-  1522     n_cls  = sum(p.numel() for p in model.classifier.parameters())
-  1523     n_fus  = sum(p.numel() for p in model.fusion.parameters())
-  1524     print(f"    AttentionUNet3D    : {n_seg:>10,} params")
-  1525     print(f"    CancerClassifier3D : {n_cls:>10,} params")
-  1526     print(f"    Fusion MLP         : {n_fus:>10,} params")
-  1527     print(f"    TOTAL              : {n_all:>10,} params")
-  1528
-  1529     # Production model size
-  1530     prod  = BrainCTEnsemble(in_ch=5, seg_classes=3, cls_classes=5, base_ch=32)
-  1531     n_prod = sum(p.numel() for p in prod.parameters())
-  1532     print(f"    Production (b=32)  : {n_prod:>10,} params")
-  1533
-  1534     # ── Synthetic CT ─────────────────────────────────────────────────────────
-  1535     print("\n[2/6] Synthesising brain CT (64 × 128 × 128) …")
-  1536     hu = _make_synthetic_ct()
-  1537     print(f"    HU range : [{hu.min():.0f},  {hu.max():.0f}]")
-  1538
-  1539     # ── Skull stripping ───────────────────────────────────────────────────────
-  1540     print("\n[3/6] Skull stripping …")
-  1541     hu_s, bmask = strip_skull(hu)
-  1542     print(f"    Brain voxels : {bmask.sum():,}")
-  1543
-  1544     # ── Multi-channel encoding ────────────────────────────────────────────────
-  1545     print("\n[4/6] Multi-window HU encoding (5 channels) …")
-  1546     vol5 = multi_channel_window(hu_s)
-  1547     print(f"    Shape  : {vol5.shape}   dtype : {vol5.dtype}")
-  1548     print(f"    Windows: {list(HU_WINDOWS.keys())}")
-  1549
-  1550     # ── Forward pass ──────────────────────────────────────────────────────────
-  1551     print("\n[5/6] Running ensemble forward pass …")
-  1552     model.eval()
-  1553     x = torch.from_numpy(vol5).unsqueeze(0)
-  1554     with torch.no_grad():
-  1555         seg_log, cls_log, fused = model(x)
-  1556
-  1557     seg_probs = torch.softmax(seg_log, 1).squeeze().numpy()
-  1558     cls_probs = torch.softmax(fused,   1).squeeze().numpy()
-  1559     seg_mask  = seg_probs.argmax(0).astype(np.uint8)
-  1560     pred_cls  = int(cls_probs.argmax())
-  1561
-  1562     # ── Loss check ────────────────────────────────────────────────────────────
-  1563     seg_tgt = torch.randint(0, 3, (1, 64, 128, 128))
-  1564     cls_tgt = torch.randint(0, 5, (1,))
-  1563     seg_tgt = torch.randint(0, 3, (1, 64, 128, 128))
-  1564     cls_tgt = torch.randint(0, 5, (1,))
-  1565     l_seg   = CombinedSegLoss()(seg_log, seg_tgt)
-  1566     l_cls   = FocalLoss()(fused, cls_tgt)
-  1567     (l_seg + l_cls).backward()
-  1568     print(f"    Dice+CE+Focal loss : {l_seg.item():.4f}")
-  1569     print(f"    Focal cls loss     : {l_cls.item():.4f}")
-  1570     print(f"    Backward pass      : OK")
-  1571
-  1572     # ── Report ────────────────────────────────────────────────────────────────
-  1573     print("\n[6/6] Results\n")
-  1574     print(f"  Segmentation")
-  1575     print(f"    Oedema voxels  : {(seg_mask==1).sum():6,}")
-  1576     print(f"    Tumour voxels  : {(seg_mask==2).sum():6,}")
-  1577     print()
-  1578     print(f"  Classification")
-  1579     for name, p in zip(CLS_NAMES, cls_probs):
-  1580         bar = chr(9608) * int(p * 32)
-  1581         print(f"    {name:<34s} {p*100:5.1f}%  {bar}")
-  1582     print()
-  1583     print(f"  Prediction : {CLS_NAMES[pred_cls]}  "
-  1584           f"(confidence {cls_probs[pred_cls]*100:.1f}%)")
-  1585
-  1586     print("\n  Rendering visualisations …")
-  1587     plot_scan(hu_s, seg_mask=seg_mask, n_slices=6,
-  1588                save_path="brain_ct_scan_result.png")
-  1589     plot_probabilities(cls_probs,
-  1590                         save_path="brain_ct_probabilities.png")
-  1591
-  1592     print()
-  1593     report = _format_report(pred_cls, float(cls_probs[pred_cls]), 0.0,
-  1594                              cls_probs, float((seg_mask==2).sum())*0.001,
-  1595                              seg_probs)
-  1596     print(report)
-  1597     print("\n  Saved: brain_ct_scan_result.png,  brain_ct_probabilities.png")
-  1598     print("=" * 65)
-  1599
-  1600
-  1601 if __name__ == "__main__":
-  1602     run_demo()
+# =============================================================================
+#   Gaith Krakdia Brain CT Scan model 1.0
+#   High-Resolution Brain CT Cancer Detection System
+#   Author  : Gaith Krakdia
+#   Version : 1.0
+# =============================================================================
+#
+#   Architecture overview
+#   ─────────────────────
+#   Stage 1 — Preprocessing
+#     · Multi-channel HU windowing (5 clinical windows)
+#     · Morphology-based skull stripping
+#     · Isotropic resampling + Z-score normalisation
+#     · 3-D sliding-window patch extraction
+#     · On-the-fly augmentation (flip / rotate / noise / shift)
+#
+#   Stage 2 — 3D Attention U-Net  (voxel-wise segmentation)
+#     · 4-level encoder with SE + residual blocks
+#     · Transformer self-attention bottleneck
+#     · Attention-gate decoder
+#     · Output: background / oedema / enhancing-tumour mask
+#
+#   Stage 3 — 3D EfficientNet classifier  (cancer type)
+#     · MBConv3D blocks with depthwise conv + SE
+#     · Output: No Finding / Low-Grade Glioma / GBM /
+#               Metastasis / Meningioma
+#
+#   Stage 4 — Ensemble fusion head
+#     · Segmentation probability summary + classifier logits → MLP
+#     · Final diagnosis probability vector
+#
+#   Stage 5 — Explainability & Uncertainty
+#     · 3D Grad-CAM (classification + segmentation)
+#     · Test-Time Augmentation (TTA × 8)
+#     · Monte-Carlo Dropout uncertainty (MC × 20)
+#
+#   Requirements
+#   ─────────────
+#   pip install torch torchvision einops scipy scikit-image
+#               SimpleITK nibabel matplotlib opencv-python
+#               scikit-learn monai tqdm
+#
+#   Quick demo (no GPU / no data needed)
+#   ──────────────────────────────────────
+#   python "Gaith Krakdia Brain CT Scan model 1.0.py"
+# =============================================================================
+
+from __future__ import annotations
+
+import ast
+import copy
+import json
+import math
+import os
+import time
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy import ndimage
+from skimage import measure, morphology
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.utils.data import DataLoader, Dataset
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 1 — PREPROCESSING
+# ══════════════════════════════════════════════════════════════════════════════
+
+HU_WINDOWS: Dict[str, Tuple[float, float]] = {
+    "brain":        (-20,   80),
+    "blood":        ( 50,  100),
+    "bone":         (400, 1000),
+    "tumor":        ( 20,   60),
+    "white_matter": ( 20,   45),
+}
+
+CLS_NAMES = [
+    "No Finding",
+    "Low-Grade Glioma",
+    "High-Grade Glioma / GBM",
+    "Metastasis",
+    "Meningioma",
+]
+
+SEG_NAMES = ["background", "oedema", "enhancing_tumour"]
+
+
+def apply_hu_window(volume: np.ndarray, wmin: float, wmax: float) -> np.ndarray:
+    """Clip HU values to [wmin, wmax] and scale linearly to [0, 1]."""
+    return (np.clip(volume, wmin, wmax) - wmin) / (wmax - wmin)
+
+
+def multi_channel_window(volume: np.ndarray) -> np.ndarray:
+    """
+    Produce a 5-channel float32 representation of a single HU volume.
+    Each channel uses a clinically meaningful window — analogous to
+    different MRI sequences in terms of tissue contrast.
+    Output shape: (5, D, H, W)
+    """
+    channels = [
+        apply_hu_window(volume, lo, hi)
+        for lo, hi in HU_WINDOWS.values()
+    ]
+    return np.stack(channels, axis=0).astype(np.float32)
+
+
+def strip_skull(
+    volume: np.ndarray,
+    hu_min: float = -20,
+    hu_max: float = 80,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Morphology-based skull stripping.
+    Returns (stripped_volume, binary_brain_mask).
+    """
+    mask = np.logical_and(volume >= hu_min, volume <= hu_max)
+    mask = morphology.remove_small_objects(mask, min_size=5_000)
+
+    filled = np.zeros_like(mask)
+    for i in range(mask.shape[0]):
+        filled[i] = ndimage.binary_fill_holes(mask[i])
+
+    labeled = measure.label(filled)
+    props   = measure.regionprops(labeled)
+    if props:
+        largest = max(props, key=lambda p: p.area)
+        mask = (labeled == largest.label)
+    else:
+        mask = filled
+
+    stripped = volume.copy().astype(np.float32)
+    stripped[~mask] = -1000
+    return stripped, mask.astype(np.uint8)
+
+
+def resample_isotropic(
+    volume: np.ndarray,
+    current_spacing: Tuple[float, ...],
+    target_spacing: float = 1.0,
+) -> np.ndarray:
+    """Resample a volume to isotropic voxel spacing via cubic zoom."""
+    zoom_factors = [s / target_spacing for s in current_spacing]
+    return ndimage.zoom(volume, zoom_factors, order=1)
+
+
+def z_score_normalize(
+    volume: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Z-score normalisation, optionally restricted to brain-mask voxels."""
+    vals  = volume[mask > 0] if mask is not None else volume.flatten()
+    mu    = vals.mean()
+    sigma = vals.std() + 1e-8
+    return (volume - mu) / sigma
+
+
+def extract_patches_3d(
+    volume: np.ndarray,
+    patch_size: int = 64,
+    stride: int = 32,
+) -> Tuple[np.ndarray, List[Tuple]]:
+    """
+    Sliding-window 3-D patch extraction.
+    Returns (patches array [N, C, D, H, W], list of (d1,h1,w1,d2,h2,w2)).
+    """
+    D, H, W = volume.shape[-3:]
+    patches, coords = [], []
+
+    for d in range(0, max(1, D - patch_size + 1), stride):
+        for h in range(0, max(1, H - patch_size + 1), stride):
+            for w in range(0, max(1, W - patch_size + 1), stride):
+                d2 = min(d + patch_size, D)
+                h2 = min(h + patch_size, H)
+                w2 = min(w + patch_size, W)
+                patch = volume[..., d:d2, h:h2, w:w2]
+                pd = patch_size - patch.shape[-3]
+                ph = patch_size - patch.shape[-2]
+                pw = patch_size - patch.shape[-1]
+                if pd > 0 or ph > 0 or pw > 0:
+                    patch = np.pad(
+                        patch,
+                        [(0, 0)] * (patch.ndim - 3) + [(0, pd), (0, ph), (0, pw)],
+                    )
+                patches.append(patch)
+                coords.append((d, h, w, d2, h2, w2))
+
+    return np.stack(patches), coords
+
+
+class CTAugmentor:
+    """On-the-fly 3-D augmentation for training."""
+
+    def __init__(self, p: float = 0.5):
+        self.p = p
+
+    def random_flip(
+        self,
+        vol: torch.Tensor,
+        seg: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        for axis in [2, 3, 4]:
+            if torch.rand(1) < self.p:
+                vol = torch.flip(vol, [axis])
+                seg = torch.flip(seg, [axis])
+        return vol, seg
+
+    def random_rotate90(
+        self,
+        vol: torch.Tensor,
+        seg: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        k = int(torch.randint(0, 4, (1,)).item())
+        return torch.rot90(vol, k, [3, 4]), torch.rot90(seg, k, [3, 4])
+
+    def random_intensity_shift(self, vol: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1) < self.p:
+            shift = (torch.rand(1) - 0.5) * 0.2
+            scale = 1.0 + (torch.rand(1) - 0.5) * 0.2
+            vol   = vol * scale + shift
+        return vol
+
+    def random_gaussian_noise(self, vol: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1) < self.p:
+            vol = vol + torch.randn_like(vol) * 0.02
+        return vol
+
+    def __call__(
+        self,
+        vol: torch.Tensor,
+        seg: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        vol, seg = self.random_flip(vol, seg)
+        vol, seg = self.random_rotate90(vol, seg)
+        vol      = self.random_intensity_shift(vol)
+        vol      = self.random_gaussian_noise(vol)
+        return vol, seg
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 2 — MODEL BUILDING BLOCKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ConvBnRelu(nn.Module):
+    """Conv3d → InstanceNorm → LeakyReLU."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel: int = 3,
+        stride: int = 1,
+        groups: int = 1,
+    ):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv3d(
+                in_ch, out_ch, kernel,
+                stride=stride, padding=kernel // 2,
+                groups=groups, bias=False,
+            ),
+            nn.InstanceNorm3d(out_ch, affine=True),
+            nn.LeakyReLU(0.1, inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class ResidualBlock(nn.Module):
+    """Pre-activation residual block with instance normalisation."""
+
+    def __init__(self, ch: int, dropout: float = 0.1):
+        super().__init__()
+        self.norm1  = nn.InstanceNorm3d(ch, affine=True)
+        self.conv1  = nn.Conv3d(ch, ch, 3, padding=1, bias=False)
+        self.norm2  = nn.InstanceNorm3d(ch, affine=True)
+        self.drop   = nn.Dropout3d(dropout)
+        self.conv2  = nn.Conv3d(ch, ch, 3, padding=1, bias=False)
+        self.act    = nn.LeakyReLU(0.1, inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(self.act(self.norm1(x)))
+        h = self.conv2(self.drop(self.act(self.norm2(h))))
+        return x + h
+
+
+class SEBlock3D(nn.Module):
+    """3-D Squeeze-and-Excitation channel attention."""
+
+    def __init__(self, ch: int, ratio: int = 4):
+        super().__init__()
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Linear(ch, max(1, ch // ratio)),
+            nn.SiLU(),
+            nn.Linear(max(1, ch // ratio), ch),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.se(x).view(x.size(0), x.size(1), 1, 1, 1)
+        return x * w
+
+
+class AttentionGate(nn.Module):
+    """
+    Spatial attention gate (Oktay et al., Attention U-Net, 2018).
+    Suppresses irrelevant skip-connection activations in the decoder.
+    """
+
+    def __init__(self, F_g: int, F_l: int, F_int: int):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv3d(F_g, F_int, 1, bias=True),
+            nn.InstanceNorm3d(F_int, affine=True),
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv3d(F_l, F_int, 1, bias=True),
+            nn.InstanceNorm3d(F_int, affine=True),
+        )
+        self.psi = nn.Sequential(
+            nn.Conv3d(F_int, 1, 1, bias=True),
+            nn.InstanceNorm3d(1, affine=True),
+            nn.Sigmoid(),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        if g1.shape != x1.shape:
+            g1 = F.interpolate(g1, size=x1.shape[2:],
+                               mode="trilinear", align_corners=False)
+        return x * self.psi(self.relu(g1 + x1))
+
+
+class TransformerBottleneck(nn.Module):
+    """
+    Lightweight ViT-style multi-head self-attention at the U-Net bottleneck.
+    Captures long-range spatial dependencies across the full volume.
+    """
+
+    def __init__(self, ch: int, heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(ch)
+        self.attn  = nn.MultiheadAttention(ch, heads,
+                                           dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(ch)
+        self.ff = nn.Sequential(
+            nn.Linear(ch, ch * 4), nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ch * 4, ch), nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, D, H, W = x.shape
+        t = rearrange(x, "b c d h w -> b (d h w) c")
+        t = t + self.attn(*([self.norm1(t)] * 3))[0]
+        t = t + self.ff(self.norm2(t))
+        return rearrange(t, "b (d h w) c -> b c d h w", d=D, h=H, w=W)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 3 — 3D ATTENTION U-NET  (Segmentation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EncoderBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            ConvBnRelu(in_ch, out_ch),
+            ResidualBlock(out_ch, dropout),
+            SEBlock3D(out_ch),
+        )
+        self.pool = nn.MaxPool3d(2)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        skip = self.conv(x)
+        return self.pool(skip), skip
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        self.up   = nn.ConvTranspose3d(in_ch, in_ch // 2, 2, stride=2)
+        self.ag   = AttentionGate(in_ch // 2, skip_ch, out_ch // 2)
+        self.conv = nn.Sequential(
+            ConvBnRelu(in_ch // 2 + skip_ch, out_ch),
+            ResidualBlock(out_ch),
+        )
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x    = self.up(x)
+        skip = self.ag(x, skip)
+        return self.conv(torch.cat([x, skip], dim=1))
+
+
+class AttentionUNet3D(nn.Module):
+    """
+    3-D Attention U-Net with Transformer bottleneck.
+
+    Input  : (B, in_channels, D, H, W)
+    Output : (B, n_classes, D, H, W)  — voxel-wise logits
+
+    Classes
+    -------
+    0  background
+    1  oedema / infiltration zone
+    2  enhancing tumour core
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 5,
+        n_classes: int = 3,
+        base_ch: int = 32,
+    ):
+        super().__init__()
+        c = base_ch
+        self.enc1 = EncoderBlock(in_channels, c)
+        self.enc2 = EncoderBlock(c,     c * 2)
+        self.enc3 = EncoderBlock(c * 2, c * 4)
+        self.enc4 = EncoderBlock(c * 4, c * 8)
+        self.bottleneck = nn.Sequential(
+            ConvBnRelu(c * 8, c * 16),
+            ResidualBlock(c * 16),
+            TransformerBottleneck(c * 16),
+        )
+        self.dec4 = DecoderBlock(c * 16, c * 8,  c * 8)
+        self.dec3 = DecoderBlock(c * 8,  c * 4,  c * 4)
+        self.dec2 = DecoderBlock(c * 4,  c * 2,  c * 2)
+        self.dec1 = DecoderBlock(c * 2,  c,      c)
+        self.head = nn.Conv3d(c, n_classes, 1)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d)):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="leaky_relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, s1 = self.enc1(x)
+        x, s2 = self.enc2(x)
+        x, s3 = self.enc3(x)
+        x, s4 = self.enc4(x)
+        x     = self.bottleneck(x)
+        x     = self.dec4(x, s4)
+        x     = self.dec3(x, s3)
+        x     = self.dec2(x, s2)
+        x     = self.dec1(x, s1)
+        return self.head(x)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4 — 3D EfficientNet-style CLASSIFIER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MBConv3D(nn.Module):
+    """Mobile inverted bottleneck with 3-D depthwise convolution + SE."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        expand: int = 6,
+        kernel: int = 3,
+        stride: int = 1,
+        se_ratio: int = 4,
+    ):
+        super().__init__()
+        mid         = in_ch * expand
+        self.expand = ConvBnRelu(in_ch, mid, 1) if expand != 1 else nn.Identity()
+        self.dw     = ConvBnRelu(mid, mid, kernel, stride=stride, groups=mid)
+        self.se     = SEBlock3D(mid, se_ratio)
+        self.proj   = nn.Sequential(
+            nn.Conv3d(mid, out_ch, 1, bias=False),
+            nn.InstanceNorm3d(out_ch, affine=True),
+        )
+        self.skip = stride == 1 and in_ch == out_ch
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.proj(self.se(self.dw(self.expand(x))))
+        return x + h if self.skip else h
+
+
+class CancerClassifier3D(nn.Module):
+    """
+    3-D EfficientNet-style patch classifier.
+
+    Input  : (B, in_channels, D, H, W)
+    Output : (B, n_classes)
+
+    Classes
+    -------
+    0  No finding / benign
+    1  Low-grade glioma
+    2  High-grade glioma / GBM
+    3  Brain metastasis
+    4  Meningioma
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 5,
+        n_classes: int = 5,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.stem = ConvBnRelu(in_channels, 32, 3, stride=2)
+        self.stages = nn.Sequential(
+            MBConv3D(32,  16,  expand=1),
+            MBConv3D(16,  24,  stride=2),
+            MBConv3D(24,  24),
+            MBConv3D(24,  40,  stride=2, kernel=5),
+            MBConv3D(40,  40,  kernel=5),
+            MBConv3D(40,  80,  stride=2),
+            MBConv3D(80,  80),
+            MBConv3D(80,  80),
+            MBConv3D(80,  112, kernel=5),
+            MBConv3D(112, 112, kernel=5),
+            MBConv3D(112, 112, kernel=5),
+            MBConv3D(112, 192, stride=2, kernel=5),
+            MBConv3D(192, 192, kernel=5),
+            MBConv3D(192, 192, kernel=5),
+            MBConv3D(192, 192, kernel=5),
+            MBConv3D(192, 320),
+        )
+        self.head = nn.Sequential(
+            ConvBnRelu(320, 1280, 1),
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(1280, n_classes),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.stages(self.stem(x)))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 5 — ENSEMBLE FUSION
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BrainCTEnsemble(nn.Module):
+    """
+    Full diagnostic pipeline in a single nn.Module:
+
+       AttentionUNet3D  ──► seg logits (B, 3, D, H, W)
+                                 │
+       CancerClassifier3D ◄──────┤  (CT + seg probs concatenated)
+                                 │
+       MetaFusion MLP   ──► final diagnosis (B, 5)
+
+    Parameters
+    ----------
+    in_ch       : input CT channels (5 for multi-window)
+    seg_classes : segmentation classes (default 3)
+    cls_classes : diagnosis classes   (default 5)
+    base_ch     : U-Net base channels (32 for production, 8 for unit tests)
+    """
+
+    def __init__(
+        self,
+        in_ch: int = 5,
+        seg_classes: int = 3,
+        cls_classes: int = 5,
+        base_ch: int = 32,
+    ):
+        super().__init__()
+        self.segmentor  = AttentionUNet3D(in_ch, seg_classes, base_ch)
+        self.classifier = CancerClassifier3D(in_ch + seg_classes, cls_classes)
+        self.fusion     = nn.Sequential(
+            nn.Linear(cls_classes + seg_classes, 128),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, cls_classes),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns
+        -------
+        seg_logits : (B, seg_classes, D, H, W)
+        cls_logits : (B, cls_classes)
+        fused      : (B, cls_classes)  ← use this for final diagnosis
+        """
+        seg_logits  = self.segmentor(x)
+        seg_probs   = torch.softmax(seg_logits, dim=1)
+        cls_input   = torch.cat([x, seg_probs], dim=1)
+        cls_logits  = self.classifier(cls_input)
+        seg_summary = seg_probs.mean(dim=[2, 3, 4])
+        fused       = self.fusion(torch.cat([cls_logits, seg_summary], dim=1))
+        return seg_logits, cls_logits, fused
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 6 — LOSS FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DiceLoss(nn.Module):
+    """Soft multi-class Dice loss."""
+
+    def __init__(self, smooth: float = 1e-5):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        probs = torch.softmax(logits, dim=1)
+        oh    = F.one_hot(targets.long(), probs.size(1)).permute(0, 4, 1, 2, 3).float()
+        dims  = (0, 2, 3, 4)
+        inter = (probs * oh).sum(dims)
+        union = (probs + oh).sum(dims)
+        return 1.0 - ((2 * inter + self.smooth) / (union + self.smooth)).mean()
+
+
+class FocalLoss(nn.Module):
+    """Focal loss — down-weights easy examples to focus on hard ones."""
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        weight: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.gamma  = gamma
+        self.weight = weight
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        ce  = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
+        p_t = torch.exp(-ce)
+        return ((1 - p_t) ** self.gamma * ce).mean()
+
+
+class CombinedSegLoss(nn.Module):
+    """Dice (0.5) + Cross-Entropy (0.3) + Focal (0.2) combined loss."""
+
+    def __init__(
+        self,
+        dice_w: float = 0.5,
+        ce_w:   float = 0.3,
+        focal_w: float = 0.2,
+    ):
+        super().__init__()
+        self.dice  = DiceLoss()
+        self.focal = FocalLoss()
+        self.w     = (dice_w, ce_w, focal_w)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            self.w[0] * self.dice(logits, targets)
+            + self.w[1] * F.cross_entropy(logits, targets.long())
+            + self.w[2] * self.focal(logits, targets.long())
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7 — GRAD-CAM EXPLAINABILITY
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GradCAM3D:
+    """
+    Gradient-weighted Class Activation Mapping for 3-D CNNs.
+
+    Usage
+    -----
+    gcam    = GradCAM3D(model, target_layer=model.classifier.stages[-1])
+    heatmap = gcam(input_tensor, class_idx=2)   # 2 = High-Grade GBM
+    heatmap shape: (D, H, W), values in [0, 1]
+    """
+
+    def __init__(self, model: nn.Module, target_layer: nn.Module):
+        self.model        = model
+        self.target_layer = target_layer
+        self._gradients: Optional[torch.Tensor] = None
+        self._activations: Optional[torch.Tensor] = None
+        target_layer.register_forward_hook(
+            lambda _, __, o: setattr(self, "_activations", o.detach()))
+        target_layer.register_full_backward_hook(
+            lambda _, __, g: setattr(self, "_gradients", g[0].detach()))
+
+    @torch.enable_grad()
+    def __call__(
+        self,
+        x: torch.Tensor,
+        class_idx: Optional[int] = None,
+    ) -> np.ndarray:
+        self.model.eval()
+        x = x.requires_grad_(True)
+        logits = self.model(x)
+        if isinstance(logits, tuple):
+            logits = logits[2]
+        if class_idx is None:
+            class_idx = int(logits.argmax(dim=1).item())
+        self.model.zero_grad()
+        logits[0, class_idx].backward()
+        weights = self._gradients.mean(dim=[2, 3, 4], keepdim=True)
+        cam     = F.relu((weights * self._activations).sum(1, keepdim=True))
+        cam     = F.interpolate(cam, size=x.shape[2:],
+                                mode="trilinear", align_corners=False)
+        cam     = cam.squeeze().cpu().numpy()
+        cam_max = cam.max()
+        return cam / (cam_max + 1e-8)
+
+
+class SegGradCAM3D:
+    """Grad-CAM adapted for the segmentation head."""
+
+    def __init__(self, model: nn.Module, target_layer: nn.Module):
+        self.model        = model
+        self.target_layer = target_layer
+        self._gradients: Optional[torch.Tensor] = None
+        self._activations: Optional[torch.Tensor] = None
+        target_layer.register_forward_hook(
+            lambda _, __, o: setattr(self, "_activations", o.detach()))
+        target_layer.register_full_backward_hook(
+            lambda _, __, g: setattr(self, "_gradients", g[0].detach()))
+
+    @torch.enable_grad()
+    def __call__(
+        self,
+        x: torch.Tensor,
+        seg_class: int = 2,
+    ) -> np.ndarray:
+        self.model.eval()
+        x          = x.requires_grad_(True)
+        seg_log, *_ = self.model(x)
+        self.model.zero_grad()
+        seg_log[:, seg_class].mean().backward()
+        weights = self._gradients.mean(dim=[2, 3, 4], keepdim=True)
+        cam     = F.relu((weights * self._activations).sum(1, keepdim=True))
+        cam     = F.interpolate(cam, size=x.shape[2:],
+                                mode="trilinear", align_corners=False)
+        cam     = cam.squeeze().cpu().numpy()
+        return cam / (cam.max() + 1e-8)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 8 — METRICS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def dice_coefficient(
+    pred: np.ndarray,
+    target: np.ndarray,
+    smooth: float = 1e-6,
+) -> float:
+    p = pred.astype(bool).flatten()
+    t = target.astype(bool).flatten()
+    return float((2 * (p & t).sum() + smooth) / (p.sum() + t.sum() + smooth))
+
+
+def hausdorff_distance_95(
+    pred: np.ndarray,
+    target: np.ndarray,
+    voxel_spacing: Tuple[float, ...] = (1.0, 1.0, 1.0),
+) -> float:
+    """95th-percentile Hausdorff distance in millimetres."""
+    from scipy.spatial import cKDTree
+    pred_pts   = np.argwhere(pred   > 0).astype(float) * np.array(voxel_spacing)
+    target_pts = np.argwhere(target > 0).astype(float) * np.array(voxel_spacing)
+    if pred_pts.size == 0 or target_pts.size == 0:
+        return float("nan")
+    d_pt = cKDTree(target_pts).query(pred_pts,  workers=-1)[0]
+    d_tp = cKDTree(pred_pts).query(target_pts,  workers=-1)[0]
+    return float(max(np.percentile(d_pt, 95), np.percentile(d_tp, 95)))
+
+
+def sensitivity_specificity(
+    pred: np.ndarray,
+    target: np.ndarray,
+) -> Dict[str, float]:
+    p  = pred.astype(bool).flatten()
+    t  = target.astype(bool).flatten()
+    tp = (p & t).sum();  tn = (~p & ~t).sum()
+    fp = (p & ~t).sum(); fn = (~p &  t).sum()
+    return dict(
+        sensitivity = float(tp / (tp + fn + 1e-8)),
+        specificity = float(tn / (tn + fp + 1e-8)),
+        ppv         = float(tp / (tp + fp + 1e-8)),
+        npv         = float(tn / (tn + fn + 1e-8)),
+    )
+
+
+def evaluate_segmentation(
+    pred_mask: np.ndarray,
+    true_mask: np.ndarray,
+    spacing: Tuple[float, ...] = (1., 1., 1.),
+) -> Dict:
+    results = {}
+    for c, name in enumerate(SEG_NAMES):
+        if c == 0:
+            continue
+        p = (pred_mask == c).astype(np.uint8)
+        t = (true_mask == c).astype(np.uint8)
+        results[name] = dict(
+            dice = dice_coefficient(p, t),
+            hd95 = hausdorff_distance_95(p, t, spacing),
+            **sensitivity_specificity(p, t),
+        )
+    return results
+
+
+def evaluate_classification(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: np.ndarray,
+) -> Dict:
+    from sklearn.metrics import (
+        cohen_kappa_score, confusion_matrix,
+        classification_report, roc_auc_score,
+    )
+    cm     = confusion_matrix(y_true, y_pred)
+    report = classification_report(y_true, y_pred,
+                                   target_names=CLS_NAMES, output_dict=True)
+    kappa  = cohen_kappa_score(y_true, y_pred, weights="quadratic")
+    try:
+        auc = (roc_auc_score(y_true, y_prob[:, 1])
+               if y_prob.shape[1] == 2
+               else roc_auc_score(y_true, y_prob,
+                                  multi_class="ovr", average="macro"))
+    except ValueError:
+        auc = float("nan")
+    return dict(confusion_matrix=cm, report=report,
+                quadratic_kappa=kappa, roc_auc=auc,
+                accuracy=report["accuracy"])
+
+
+def expected_calibration_error(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n_bins: int = 15,
+) -> float:
+    confidences = y_prob.max(axis=1)
+    predictions = y_prob.argmax(axis=1)
+    accuracies  = (predictions == y_true).astype(float)
+    ece = 0.0
+    for lo, hi in zip(
+        np.linspace(0, 1, n_bins + 1)[:-1],
+        np.linspace(0, 1, n_bins + 1)[1:],
+    ):
+        mask = (confidences >= lo) & (confidences < hi)
+        if mask.sum():
+            ece += mask.mean() * abs(accuracies[mask].mean()
+                                     - confidences[mask].mean())
+    return float(ece)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 9 — DATASET
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BrainCTDataset(Dataset):
+    """
+    Torch Dataset that reads from a JSON manifest:
+
+    [
+      {
+        "id":      "case_001",
+        "ct":      "path/to/volume.npy",   (D, H, W) float32 HU
+        "seg":     "path/to/mask.npy",     (D, H, W) uint8 {0,1,2}
+        "label":   2,                      class index
+        "spacing": [1.0, 1.0, 1.0]         voxel spacing in mm
+      }, ...
+    ]
+
+    Compatible with BraTS, TCGA-GBM, and LIDC-IDRI naming conventions.
+    Foreground-oversampled patch extraction ensures rare tumour voxels
+    are seen during training.
+    """
+
+    def __init__(
+        self,
+        manifest_path: str,
+        patch_size: int = 64,
+        patches_per_volume: int = 8,
+        augment: bool = True,
+        foreground_oversample: float = 0.67,
+    ):
+        with open(manifest_path, encoding="utf-8") as f:
+            self.records = json.load(f)
+        self.patch_size = patch_size
+        self.n_patches  = patches_per_volume
+        self.augment    = augment
+        self.fg_rate    = foreground_oversample
+        self.augmentor  = CTAugmentor(p=0.5)
+
+    def __len__(self) -> int:
+        return len(self.records) * self.n_patches
+
+    def _load(self, idx: int) -> Dict:
+        rec     = self.records[idx // self.n_patches]
+        hu      = np.load(rec["ct"]).astype(np.float32)
+        seg     = np.load(rec["seg"]).astype(np.uint8)
+        spacing = tuple(rec.get("spacing", [1.0, 1.0, 1.0]))
+        hu, mask = strip_skull(hu)
+        hu       = z_score_normalize(hu, mask)
+        return dict(vol5=multi_channel_window(hu), seg=seg,
+                    label=int(rec["label"]), spacing=spacing)
+
+    def _sample_patch(
+        self,
+        vol5: np.ndarray,
+        seg: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        D, H, W = vol5.shape[1:]
+        ps      = self.patch_size
+        if np.random.rand() < self.fg_rate and (seg > 0).any():
+            fc = np.argwhere(seg > 0)
+            c  = fc[np.random.randint(len(fc))]
+        else:
+            c = [np.random.randint(D), np.random.randint(H), np.random.randint(W)]
+
+        d0 = int(np.clip(c[0] - ps // 2, 0, max(0, D - ps)))
+        h0 = int(np.clip(c[1] - ps // 2, 0, max(0, H - ps)))
+        w0 = int(np.clip(c[2] - ps // 2, 0, max(0, W - ps)))
+
+        vp = vol5[:, d0:d0+ps, h0:h0+ps, w0:w0+ps]
+        sp = seg[    d0:d0+ps, h0:h0+ps, w0:w0+ps]
+        pd, ph, pw = ps - vp.shape[1], ps - vp.shape[2], ps - vp.shape[3]
+        if pd or ph or pw:
+            vp = np.pad(vp, [(0,0),(0,pd),(0,ph),(0,pw)])
+            sp = np.pad(sp,         [(0,pd),(0,ph),(0,pw)])
+        return vp, sp
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        data      = self._load(idx)
+        vp, sp    = self._sample_patch(data["vol5"], data["seg"])
+        vol_t     = torch.from_numpy(vp.copy()).float()
+        seg_t     = torch.from_numpy(sp.copy()).long()
+        if self.augment:
+            vol_t, seg_f = self.augmentor(vol_t.unsqueeze(0),
+                                          seg_t.unsqueeze(0).float())
+            vol_t = vol_t.squeeze(0)
+            seg_t = seg_f.squeeze(0).long()
+        return dict(image=vol_t, seg_mask=seg_t,
+                    label=torch.tensor(data["label"], dtype=torch.long))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 10 — TRAINING ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EMA:
+    """Exponential Moving Average of model weights for lower-variance inference."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.model = copy.deepcopy(model).eval()
+        self.decay = decay
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for ep, mp in zip(self.model.parameters(), model.parameters()):
+            ep.data.mul_(self.decay).add_(mp.data, alpha=1 - self.decay)
+
+
+class Trainer:
+    """
+    Full training loop with:
+      · Mixed-precision (AMP)
+      · Cosine annealing with warm restarts
+      · EMA weight averaging
+      · Early stopping
+      · Best-checkpoint saving
+
+    Parameters
+    ----------
+    model           : BrainCTEnsemble instance
+    train_loader    : DataLoader yielding {image, seg_mask, label}
+    val_loader      : DataLoader 
+    device          : 'cuda' or 'cpu'
+    lr              : peak learning rate
+    weight_decay    : AdamW L2 regularisation
+    max_epochs      : hard ceiling on training epochs
+    patience        : early-stopping patience
+    checkpoint_path : where to save the best checkpoint
+    """
+
+    def __init__(
+        self,
+        model: BrainCTEnsemble,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        device: str = "cuda",
+        lr: float = 3e-4,
+        weight_decay: float = 1e-5,
+        max_epochs: int = 200,
+        patience: int = 25,
+        checkpoint_path: str = "best_brain_ct_model.pth",
+    ):
+        self.model    = model.to(device)
+        self.ema      = EMA(model)
+        self.train_dl = train_loader
+        self.val_dl   = val_loader
+        self.device   = device
+        self.epochs   = max_epochs
+        self.patience = patience
+        self.ckpt     = checkpoint_path
+
+        self.seg_loss  = CombinedSegLoss()
+        self.cls_loss  = FocalLoss(gamma=2.0)
+        self.fuse_loss = FocalLoss(gamma=2.0)
+
+        self.opt    = AdamW(model.parameters(), lr=lr,
+                            weight_decay=weight_decay, betas=(0.9, 0.999))
+        self.sched  = CosineAnnealingWarmRestarts(self.opt, T_0=50, T_mult=2,
+                                                  eta_min=lr * 0.01)
+        self.scaler = GradScaler()
+
+        self.best_val_loss     = float("inf")
+        self.epochs_no_improve = 0
+        self.history: Dict[str, list] = {
+            "train_loss": [], "val_loss": [],
+            "val_auc":    [], "val_kappa": [],
+        }
+
+    def _run_epoch(self, loader: DataLoader, train: bool) -> Dict[str, float]:
+        self.model.train(train)
+        seg_tot = cls_tot = fused_tot = total = 0.0
+        all_preds, all_labels, all_probs = [], [], []
+
+        ctx = torch.enable_grad if train else torch.no_grad
+        with ctx():
+            for batch in tqdm(loader, leave=False,
+                              desc="train" if train else " val "):
+                imgs    = batch["image"].to(self.device)
+                seg_tgt = batch["seg_mask"].to(self.device)
+                cls_tgt = batch["label"].to(self.device)
+
+                with autocast():
+                    seg_log, cls_log, fused = self.model(imgs)
+                    l_seg   = self.seg_loss(seg_log, seg_tgt)
+                    l_cls   = self.cls_loss(cls_log, cls_tgt)
+                    l_fused = self.fuse_loss(fused,  cls_tgt)
+                    loss    = 0.4 * l_seg + 0.3 * l_cls + 0.3 * l_fused
+
+                if train:
+                    self.opt.zero_grad()
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.opt)
+                    nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.scaler.step(self.opt)
+                    self.scaler.update()
+                    self.ema.update(self.model)
+
+                B = imgs.size(0)
+                seg_tot   += l_seg.item()   * B
+                cls_tot   += l_cls.item()   * B
+                fused_tot += l_fused.item() * B
+                total     += loss.item()    * B
+
+                probs = torch.softmax(fused, 1).detach().cpu().numpy()
+                all_probs.append(probs)
+                all_preds.append(probs.argmax(1))
+                all_labels.append(cls_tgt.cpu().numpy())
+
+        N   = len(loader.dataset)
+        prb = np.concatenate(all_probs)
+        prd = np.concatenate(all_preds)
+        lbl = np.concatenate(all_labels)
+        met = evaluate_classification(lbl, prd, prb)
+        ece = expected_calibration_error(lbl, prb)
+
+        return dict(loss=total/N, loss_seg=seg_tot/N, loss_cls=cls_tot/N,
+                    loss_fused=fused_tot/N, accuracy=met["accuracy"],
+                    roc_auc=met["roc_auc"], kappa=met["quadratic_kappa"], ece=ece)
+
+    def fit(self) -> Dict[str, list]:
+        for epoch in range(1, self.epochs + 1):
+            t0 = time.time()
+            tr = self._run_epoch(self.train_dl, train=True)
+            va = self._run_epoch(self.val_dl,   train=False)
+            self.sched.step()
+
+            self.history["train_loss"].append(tr["loss"])
+            self.history["val_loss"].append(va["loss"])
+            self.history["val_auc"].append(va["roc_auc"])
+            self.history["val_kappa"].append(va["kappa"])
+
+            print(
+                f"Epoch {epoch:03d}/{self.epochs}  "
+                f"loss tr={tr['loss']:.4f} va={va['loss']:.4f}  "
+                f"acc={va['accuracy']:.4f}  AUC={va['roc_auc']:.4f}  "
+                f"κ={va['kappa']:.4f}  ECE={va['ece']:.4f}  "
+                f"[{time.time()-t0:.1f}s]"
+            )
+
+            if va["loss"] < self.best_val_loss:
+                self.best_val_loss     = va["loss"]
+                self.epochs_no_improve = 0
+                torch.save(dict(epoch=epoch, model=self.model.state_dict(),
+                                ema=self.ema.model.state_dict(),
+                                optimizer=self.opt.state_dict(),
+                                metrics=va), self.ckpt)
+                print(f"  ✓ checkpoint saved  (val_loss={va['loss']:.4f})")
+            else:
+                self.epochs_no_improve += 1
+                if self.epochs_no_improve >= self.patience:
+                    print(f"  Early stopping at epoch {epoch}.")
+                    break
+
+        ckpt = torch.load(self.ckpt, map_location=self.device)
+        self.model.load_state_dict(ckpt["model"])
+        print(f"\nTraining complete.  Best val loss: {self.best_val_loss:.4f}")
+        return self.history
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 11 — INFERENCE ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BrainCTScanner:
+    """
+    End-to-end inference for a single brain CT volume.
+
+    Steps
+    -----
+    1. Multi-channel HU windowing
+    2. Sliding-window 3-D segmentation (overlap-tile)
+    3. TTA × tta_n classification
+    4. MC-Dropout × mc_dropout_n uncertainty estimation
+    5. 3-D Grad-CAM heatmaps
+    6. Structured clinical report
+
+    Parameters
+    ----------
+    model_path   : path to a saved BrainCTEnsemble checkpoint
+    device       : 'cuda' or 'cpu'
+    patch_size   : cubic patch size for sliding window
+    stride       : window stride (use stride < patch_size for overlap)
+    tta_n        : test-time augmentation passes
+    mc_dropout_n : MC-Dropout samples (0 = disabled)
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "cuda",
+        patch_size: int = 64,
+        stride: int = 32,
+        tta_n: int = 8,
+        mc_dropout_n: int = 20,
+    ):
+        self.device     = torch.device(
+            device if torch.cuda.is_available() else "cpu")
+        self.patch_size = patch_size
+        self.stride     = stride
+        self.tta_n      = tta_n
+        self.mc_n       = mc_dropout_n
+        self.augmentor  = CTAugmentor(p=1.0)
+
+        self.model = BrainCTEnsemble(in_ch=5, seg_classes=3, cls_classes=5)
+        ckpt  = torch.load(model_path, map_location=self.device)
+        state = ckpt.get("ema", ckpt.get("model", ckpt))
+        self.model.load_state_dict(state)
+        self.model.to(self.device).eval()
+
+        self.gcam      = GradCAM3D(self.model, 
+                                   self.model.classifier.stages[-1])
+        self.seg_gcam = SegGradCAM3D(self.model,
+                                      self.model.segmentor.dec1)
+
+    @torch.no_grad()
+    def _segment_volume(self, vol5: np.ndarray) -> np.ndarray:
+        D, H, W   = vol5.shape[1:]
+        seg_sum   = np.zeros((3, D, H, W), dtype=np.float32)
+        count_map = np.zeros((D, H, W),    dtype=np.float32)
+
+        patches, coords = extract_patches_3d(vol5, self.patch_size, self.stride)
+        for patch, (d1, h1, w1, d2, h2, w2) in zip(patches, coords):
+            t = torch.from_numpy(patch).unsqueeze(0).to(self.device)
+            prob = torch.softmax(self.model(t)[0], 1).squeeze(0).cpu().numpy()
+            pd, ph, pw = d2 - d1, h2 - h1, w2 - w1
+            seg_sum[:, d1:d2, h1:h2, w1:w2] += prob[:, :pd, :ph, :pw]
+            count_map[   d1:d2, h1:h2, w1:w2] += 1.0
+
+        return seg_sum / np.maximum(count_map[None], 1)
+
+    def _classify_tta(self, x: torch.Tensor) -> np.ndarray:
+        dummy = torch.zeros(x.size(0), 3, *x.shape[2:], device=self.device)
+        probs = []
+        for _ in range(self.tta_n):
+            aug, _ = self.augmentor(x.clone(), torch.zeros_like(x[:, :1]))
+            inp    = torch.cat([aug, dummy], dim=1)
+            with torch.no_grad():
+                probs.append(
+                    torch.softmax(self.model.classifier(inp), 1).cpu().numpy())
+        return np.stack(probs).mean(0)
+
+    def _mc_uncertainty(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if self.mc_n == 0:
+            return None, None
+
+        dummy = torch.zeros(x.size(0), 3, *x.shape[2:], device=self.device)
+        inp   = torch.cat([x, dummy], dim=1)
+
+        def _enable_dropout(m):
+            if isinstance(m, (nn.Dropout, nn.Dropout3d)):
+                m.train()
+
+        self.model.apply(_enable_dropout)
+        samples = []
+        with torch.no_grad():
+            for _ in range(self.mc_n):
+                samples.append(
+                    torch.softmax(self.model.classifier(inp), 1).cpu().numpy())
+        self.model.eval()
+        samples = np.stack(samples)
+        return samples.mean(0), samples.var(0).sum(-1)
+
+    def scan(
+        self,
+        hu_volume: np.ndarray,
+        voxel_spacing: Tuple[float, ...] = (1., 1., 1.),
+    ) -> Dict:
+        """
+        Run the full diagnostic pipeline on one CT volume.
+
+        Parameters
+        ----------
+        hu_volume     : (D, H, W) Hounsfield Unit array
+        voxel_spacing : (dx, dy, dz) in millimetres
+
+        Returns
+        -------
+        {
+           seg_mask    : (D, H, W) uint8  — 0/1/2 class labels
+           seg_probs   : (3, D, H, W)     — soft probabilities
+           cls_probs   : (5,)             — diagnosis probabilities
+           cls_label   : str              — top diagnosis
+           confidence  : float            — top-class probability
+           uncertainty : float            — MC-Dropout variance
+           gradcam_cls : (D, H, W)        — classification saliency map
+           gradcam_seg : (D, H, W)        — segmentation saliency map
+           report      : str              — formatted clinical report
+        }
+        """
+        print("[1/5] Multi-channel HU windowing …")
+        vol5 = multi_channel_window(hu_volume)
+
+        print("[2/5] Sliding-window segmentation …")
+        seg_probs = self._segment_volume(vol5)
+        seg_mask  = seg_probs.argmax(0).astype(np.uint8)
+
+        print("[3/5] TTA classification …")
+        x    = torch.from_numpy(vol5).unsqueeze(0).to(self.device)
+        tta  = self._classify_tta(x)
+        mc_p, unc = self._mc_uncertainty(x)
+        cls_probs  = (0.6 * tta + 0.4 * mc_p) if mc_p is not None else tta
+        uncertainty = float(unc[0]) if unc is not None else 0.0
+
+        cls_idx    = int(cls_probs.argmax(1)[0])
+        confidence = float(cls_probs[0, cls_idx])
+
+        print("[4/5] Generating Grad-CAM heatmaps …")
+        gradcam_cls = self.gcam(x, class_idx=cls_idx)
+        gradcam_seg = self.seg_gcam(x, seg_class=2)
+
+        print("[5/5] Generating report …")
+        vv             = float(np.prod(voxel_spacing)) / 1000.0
+        tumour_vol_cm3 = float((seg_mask == 2).sum()) * vv
+        report         = _format_report(cls_idx, confidence, uncertainty,
+                                        cls_probs[0], tumour_vol_cm3, seg_probs)
+
+        return dict(seg_mask=seg_mask, seg_probs=seg_probs,
+                    cls_probs=cls_probs[0], cls_label=CLS_NAMES[cls_idx],
+                    confidence=confidence, uncertainty=uncertainty,
+                    gradcam_cls=gradcam_cls, gradcam_seg=gradcam_seg,
+                    report=report)
+
+
+def _format_report(
+    cls_idx: int,
+    confidence: float,
+    uncertainty: float,
+    probs: np.ndarray,
+    tumour_vol: float,
+    seg_probs: np.ndarray,
+) -> str:
+    risk = ("CRITICAL" if cls_idx in (2, 3) and confidence > 0.70 else
+            "HIGH"     if cls_idx in (1, 2, 3)                     else
+            "LOW")
+    oedema_vol = float((seg_probs.argmax(0) == 1).sum()) * 0.001
+    lines = [
+        "=" * 65,
+        "  Gaith Krakdia Brain CT Scan model 1.0",
+        "  CANCER DETECTION REPORT",
+        "=" * 65,
+        f"  Diagnosis     : {CLS_NAMES[cls_idx]}",
+        f"  Risk Level    : {risk}",
+        f"  Confidence    : {confidence * 100:.1f}%",
+        f"  Uncertainty   : {uncertainty:.4f}  (MC-Dropout epistemic)",
+        "",
+        "  Class Probabilities:",
+    ]
+    for name, p in zip(CLS_NAMES, probs):
+        bar = chr(9608) * int(p * 30)
+        lines.append(f"    {name:<34s}  {p * 100:5.1f}%  {bar}")
+    lines += [
+        "",
+        "  Segmentation Volumes:",
+        f"    Oedema zone          : {oedema_vol:.2f} cm3",
+        f"    Enhancing tumour     : {tumour_vol:.2f} cm3",
+        "",
+        "  WARNING: AI output is for research / decision-support only.",
+        "           All findings MUST be reviewed by a qualified radiologist.",
+        "=" * 65,
+    ]
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 12 — VISUALISATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SEG_COLORS = np.array([
+    [0,   0,   0  ],
+    [0,   255, 255],
+    [255, 50,  50 ],
+], dtype=np.float32) / 255.0
+
+
+def _hu_to_uint8(vol: np.ndarray, wmin=-20, wmax=80) -> np.ndarray:
+    return ((np.clip(vol, wmin, wmax) - wmin) / (wmax - wmin) * 255).astype(np.uint8)
+
+
+def _overlay_seg(ct: np.ndarray, seg: np.ndarray, alpha=0.4) -> np.ndarray:
+    rgb = cv2.cvtColor(ct, cv2.COLOR_GRAY2RGB).astype(float)
+    for c in range(1, 3):
+        mask  = (seg == c)
+        color = _SEG_COLORS[c] * 255
+        for ch in range(3):
+            rgb[..., ch] = np.where(mask,
+                                    rgb[..., ch] * (1 - alpha) + color[ch] * alpha,
+                                    rgb[..., ch])
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def _overlay_cam(ct: np.ndarray, cam: np.ndarray, alpha=0.5) -> np.ndarray:
+    jet = cv2.applyColorMap((cam * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    rgb = cv2.cvtColor(ct, cv2.COLOR_GRAY2RGB)
+    return cv2.addWeighted(rgb, 1 - alpha, jet, alpha, 0)
+
+
+def plot_scan(
+    hu_volume: np.ndarray,
+    seg_mask: Optional[np.ndarray] = None,
+    gradcam: Optional[np.ndarray] = None,
+    n_slices: int = 6,
+    title: str = "Gaith Krakdia Brain CT Scan model 1.0",
+    save_path: Optional[str] = None,
+):
+    """
+    Multi-slice visualisation:
+      Row 1 — raw CT (brain window)
+      Row 2 — segmentation overlay    (if seg_mask provided)
+      Row 3 — Grad-CAM overlay        (if gradcam provided)
+    """
+    idxs   = np.linspace(0, hu_volume.shape[0] - 1, n_slices, dtype=int)
+    n_rows = 1 + (seg_mask is not None) + (gradcam is not None)
+    fig, axes = plt.subplots(n_rows, n_slices, 
+                             figsize=(n_slices * 3, n_rows * 3))
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    for col, idx in enumerate(idxs):
+        ct = _hu_to_uint8(hu_volume[idx])
+        axes[0, col].imshow(ct, cmap="gray", vmin=0, vmax=255)
+        axes[0, col].set_title(f"z={idx}", fontsize=9)
+        axes[0, col].axis("off")
+        r = 1
+        if seg_mask is not None:
+            axes[r, col].imshow(_overlay_seg(ct, seg_mask[idx]))
+            axes[r, col].axis("off")
+            r += 1
+        if gradcam is not None:
+            axes[r, col].imshow(_overlay_cam(ct, gradcam[idx]))
+            axes[r, col].axis("off")
+
+    row_labels = ["CT (brain window)"]
+    if seg_mask is not None: row_labels.append("Segmentation")
+    if gradcam  is not None: row_labels.append("Grad-CAM")
+    for row, label in enumerate(row_labels):
+        axes[row, 0].set_ylabel(label, fontsize=10)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved: {save_path}")
+    else:
+        plt.show()
+
+
+def plot_probabilities(
+    cls_probs: np.ndarray,
+    save_path: Optional[str] = None,
+):
+    """Horizontal probability bar chart with colour-coded risk."""
+    colors = ["#4CAF50", "#8BC34A", "#FF9800", "#F44336", "#9C27B0"]
+    fig, ax = plt.subplots(figsize=(9, 4))
+    y = range(len(CLS_NAMES))
+    bars = ax.barh(y, cls_probs * 100, color=colors, edgecolor="white", height=0.6)
+    ax.set_yticks(y)
+    ax.set_yticklabels(CLS_NAMES, fontsize=11)
+    ax.set_xlabel("Probability (%)", fontsize=11)
+    ax.set_title("Gaith Krakdia Brain CT Scan — Cancer Classification",
+                 fontsize=12, fontweight="bold")
+    ax.set_xlim(0, 108)
+    ax.axvline(50, color="gray", linestyle="--", lw=0.8, alpha=0.5)
+    for bar, p in zip(bars, cls_probs):
+        ax.text(bar.get_width() + 1.5, bar.get_y() + bar.get_height() / 2,
+                f"{p*100:.1f}%", va="center", fontsize=10, fontweight="bold")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    else:
+        plt.show()
+
+
+def plot_training_curves(
+    history: Dict[str, list],
+    save_path: Optional[str] = None,
+):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
+    ax1.plot(history["train_loss"], label="Train", color="#2196F3")
+    ax1.plot(history["val_loss"],   label="Val",   color="#F44336")
+    ax1.set_xlabel("Epoch"); ax1.set_ylabel("Loss")
+    ax1.set_title("Loss Curves"); ax1.legend(); ax1.grid(alpha=0.3)
+
+    ax2.plot(history["val_auc"],   label="Val AUC",   color="#4CAF50")
+    ax2.plot(history["val_kappa"], label="Val Kappa",  color="#FF9800")
+    ax2.set_xlabel("Epoch"); ax2.set_ylabel("Score")
+    ax2.set_title("Validation Metrics"); ax2.legend()
+    ax2.set_ylim(0, 1); ax2.grid(alpha=0.3)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    else:
+        plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 13 — DEMO  (run with:  python "Gaith Krakdia Brain CT Scan model 1.0.py")
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _make_synthetic_ct(shape=(64, 128, 128), seed=42) -> np.ndarray:
+    """Generate a synthetic HU volume with an embedded GBM-like lesion."""
+    rng = np.random.default_rng(seed)
+    vol = rng.normal(-10, 15, shape).astype(np.float32)
+    D, H, W = shape
+    z, y, x = np.ogrid[:D, :H, :W]
+
+    brain = ((z-D//2)**2/(D//3)**2 + (y-H//2)**2/(H//2.5)**2 + 
+             (x-W//2)**2/(W//2.5)**2) < 1
+    vol[brain] = rng.normal(35, 8, int(brain.sum()))
+
+    lesion = ((z-D//2-4)**2/8**2 + (y-H//2-6)**2/12**2 + 
+               (x-W//2+8)**2/12**2) < 1
+    vol[lesion] = rng.normal(55, 12, int(lesion.sum()))
+
+    necrosis = ((z-D//2-5)**2/4**2 + (y-H//2-5)**2/5**2 + 
+                 (x-W//2+9)**2/5**2) < 1
+    vol[necrosis] = rng.normal(-20, 5, int(necrosis.sum()))
+
+    return vol
+
+
+def run_demo():
+    print("=" * 65)
+    print("  Gaith Krakdia Brain CT Scan model 1.0  —  Demo")
+    print("=" * 65)
+
+    # ── Build model ───────────────────────────────────────────────────────────
+    print("\n[1/6] Initialising BrainCTEnsemble …")
+    model  = BrainCTEnsemble(in_ch=5, seg_classes=3, cls_classes=5, base_ch=16)
+    n_all  = sum(p.numel() for p in model.parameters())
+    n_seg  = sum(p.numel() for p in model.segmentor.parameters())
+    n_cls  = sum(p.numel() for p in model.classifier.parameters())
+    n_fus  = sum(p.numel() for p in model.fusion.parameters())
+    print(f"    AttentionUNet3D    : {n_seg:>10,} params")
+    print(f"    CancerClassifier3D : {n_cls:>10,} params")
+    print(f"    Fusion MLP         : {n_fus:>10,} params")
+    print(f"    TOTAL              : {n_all:>10,} params")
+
+    # Production model size
+    prod  = BrainCTEnsemble(in_ch=5, seg_classes=3, cls_classes=5, base_ch=32)
+    n_prod = sum(p.numel() for p in prod.parameters())
+    print(f"    Production (b=32)  : {n_prod:>10,} params")
+
+    # ── Synthetic CT ─────────────────────────────────────────────────────────
+    print("\n[2/6] Synthesising brain CT (64 × 128 × 128) …")
+    hu = _make_synthetic_ct()
+    print(f"    HU range : [{hu.min():.0f},  {hu.max():.0f}]")
+
+    # ── Skull stripping ───────────────────────────────────────────────────────
+    print("\n[3/6] Skull stripping …")
+    hu_s, bmask = strip_skull(hu)
+    print(f"    Brain voxels : {bmask.sum():,}")
+
+    # ── Multi-channel encoding ────────────────────────────────────────────────
+    print("\n[4/6] Multi-window HU encoding (5 channels) …")
+    vol5 = multi_channel_window(hu_s)
+    print(f"    Shape  : {vol5.shape}   dtype : {vol5.dtype}")
+    print(f"    Windows: {list(HU_WINDOWS.keys())}")
+
+    # ── Forward pass ──────────────────────────────────────────────────────────
+    print("\n[5/6] Running ensemble forward pass …")
+    model.eval()
+    x = torch.from_numpy(vol5).unsqueeze(0)
+    with torch.no_grad():
+        seg_log, cls_log, fused = model(x)
+
+    seg_probs = torch.softmax(seg_log, 1).squeeze().numpy()
+    cls_probs = torch.softmax(fused,   1).squeeze().numpy()
+    seg_mask  = seg_probs.argmax(0).astype(np.uint8)
+    pred_cls  = int(cls_probs.argmax())
+
+    # ── Loss check ────────────────────────────────────────────────────────────
+    seg_tgt = torch.randint(0, 3, (1, 64, 128, 128))
+    cls_tgt = torch.randint(0, 5, (1,))
+    l_seg   = CombinedSegLoss()(seg_log, seg_tgt)
+    l_cls   = FocalLoss()(fused, cls_tgt)
+    (l_seg + l_cls).backward()
+    print(f"    Dice+CE+Focal loss : {l_seg.item():.4f}")
+    print(f"    Focal cls loss     : {l_cls.item():.4f}")
+    print(f"    Backward pass      : OK")
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    print("\n[6/6] Results\n")
+    print(f"  Segmentation")
+    print(f"    Oedema voxels  : {(seg_mask==1).sum():6,}")
+    print(f"    Tumour voxels  : {(seg_mask==2).sum():6,}")
+    print()
+    print(f"  Classification")
+    for name, p in zip(CLS_NAMES, cls_probs):
+        bar = chr(9608) * int(p * 32)
+        print(f"    {name:<34s} {p*100:5.1f}%  {bar}")
+    print()
+    print(f"  Prediction : {CLS_NAMES[pred_cls]}  "
+          f"(confidence {cls_probs[pred_cls]*100:.1f}%)")
+
+    print("\n  Rendering visualisations …")
+    plot_scan(hu_s, seg_mask=seg_mask, n_slices=6, 
+               save_path="brain_ct_scan_result.png")
+    plot_probabilities(cls_probs, 
+                         save_path="brain_ct_probabilities.png")
+
+    print()
+    report = _format_report(pred_cls, float(cls_probs[pred_cls]), 0.0, 
+                              cls_probs, float((seg_mask==2).sum())*0.001, 
+                              seg_probs)
+    print(report)
+    print("\n  Saved: brain_ct_scan_result.png,  brain_ct_probabilities.png")
+    print("=" * 65)
+
+
+if __name__ == "__main__":
+    run_demo()
